@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# 人脸数据（隐私敏感）
+face_data/*.pkl
+face_data/*.npy
+
+# DeepFace 模型缓存
+.deepface/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
