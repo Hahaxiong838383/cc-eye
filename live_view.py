@@ -27,6 +27,8 @@ import platform
 parser = argparse.ArgumentParser(description="cc-eye 实时标注预览")
 parser.add_argument("--mediapipe", action="store_true", help="启用 MediaPipe 手部+面部")
 parser.add_argument("--no-yolo", action="store_true", help="禁用 YOLO")
+parser.add_argument("--yolo-model", default="yolov8m.pt", help="YOLO 模型 (默认 yolov8m.pt，更精确)")
+parser.add_argument("--conf", type=float, default=0.25, help="YOLO 置信度阈值 (默认 0.25，越低检测越多)")
 args = parser.parse_args()
 
 # ── 摄像头 ──
@@ -43,8 +45,8 @@ yolo_enabled = not args.no_yolo
 if yolo_enabled:
     try:
         from ultralytics import YOLO
-        yolo = YOLO("yolov8n.pt")
-        print("YOLO 加载完成")
+        yolo = YOLO(args.yolo_model)
+        print(f"YOLO 加载完成: {args.yolo_model} (conf={args.conf})")
     except Exception as e:
         print(f"YOLO 加载失败: {e}")
         yolo_enabled = False
@@ -99,20 +101,68 @@ while True:
     h, w = frame.shape[:2]
     frame_count += 1
 
-    # ── YOLO 物体检测（每 3 帧）──
-    if yolo_enabled and yolo and frame_count % 3 == 0:
-        yolo_results = yolo(frame, verbose=False, conf=0.35)
+    # ── YOLO 物体检测（每 2 帧，M4 32GB 跑得动）──
+    if yolo_enabled and yolo and frame_count % 2 == 0:
+        yolo_results = yolo(frame, verbose=False, conf=args.conf)
 
+    # 类别配色表（按语义分组）
+    CATEGORY_COLORS = {
+        "person": (50, 200, 50),      # 绿
+        "chair": (200, 150, 50),      # 蓝金
+        "couch": (200, 150, 50),
+        "bed": (200, 150, 50),
+        "dining table": (200, 150, 50),
+        "desk": (200, 150, 50),
+        "tv": (255, 100, 100),        # 浅红（电子设备）
+        "laptop": (255, 100, 100),
+        "cell phone": (255, 100, 100),
+        "keyboard": (255, 100, 100),
+        "mouse": (255, 100, 100),
+        "remote": (255, 100, 100),
+        "monitor": (255, 100, 100),
+        "cup": (100, 200, 255),       # 浅蓝（日用品）
+        "bottle": (100, 200, 255),
+        "book": (100, 200, 255),
+        "clock": (100, 200, 255),
+        "vase": (100, 200, 255),
+        "scissors": (100, 200, 255),
+        "backpack": (180, 100, 255),  # 紫（随身物品）
+        "handbag": (180, 100, 255),
+        "umbrella": (180, 100, 255),
+        "suitcase": (180, 100, 255),
+    }
+    DEFAULT_COLOR = (200, 200, 100)   # 其他类别：浅黄
+
+    obj_count = {}
     if yolo_enabled and yolo_results:
         for r in yolo_results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 label = yolo.names[int(box.cls[0])]
                 conf = float(box.conf[0])
-                color = (50, 200, 50) if label == "person" else (200, 150, 50)
+                color = CATEGORY_COLORS.get(label, DEFAULT_COLOR)
+
+                # 统计物体数量
+                obj_count[label] = obj_count.get(label, 0) + 1
+
+                # 画框 + 标签（半透明背景增强可读性）
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{label} {conf:.0%}", (x1, y1 - 8),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                txt = f"{label} {conf:.0%}"
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+                cv2.putText(frame, txt, (x1 + 2, y1 - 4),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+    # 右下角物体统计面板
+    if yolo_enabled and obj_count:
+        panel_y = h - 30 - len(obj_count) * 22
+        cv2.putText(frame, f"Objects: {sum(obj_count.values())}", (w - 200, panel_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        for i, (lbl, cnt) in enumerate(sorted(obj_count.items(), key=lambda x: -x[1])):
+            color = CATEGORY_COLORS.get(lbl, DEFAULT_COLOR)
+            cy = panel_y + 22 * (i + 1)
+            cv2.putText(frame, f"  {lbl}: {cnt}", (w - 200, cy),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
     # ── 人脸检测 ──
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
