@@ -182,6 +182,10 @@ def main():
                 if face_count > 0 and prev_face_count == 0:
                     log_event("person_appeared", f"检测到 {face_count} 张脸")
                     print(f"[cc-eye daemon] 有人来了！({face_count} 张脸)")
+                    # 写入信号文件，cc 下次对话时能感知到
+                    Path("/tmp/cc-eye-person-arrived.flag").write_text(
+                        datetime.now().isoformat()
+                    )
                 elif face_count == 0 and prev_face_count > 0:
                     log_event("person_left", "画面中无人")
                     print("[cc-eye daemon] 人走了")
