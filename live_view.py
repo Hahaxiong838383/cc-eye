@@ -27,8 +27,8 @@ import platform
 parser = argparse.ArgumentParser(description="cc-eye 实时标注预览")
 parser.add_argument("--mediapipe", action="store_true", help="启用 MediaPipe 手部+面部")
 parser.add_argument("--no-yolo", action="store_true", help="禁用 YOLO")
-parser.add_argument("--yolo-model", default="yolov8m.pt", help="YOLO 模型 (默认 yolov8m.pt，更精确)")
-parser.add_argument("--conf", type=float, default=0.25, help="YOLO 置信度阈值 (默认 0.25，越低检测越多)")
+parser.add_argument("--yolo-model", default="yolov8x.pt", help="YOLO 模型 (默认 yolov8x.pt，最高精度)")
+parser.add_argument("--conf", type=float, default=0.15, help="YOLO 置信度阈值 (默认 0.15，检测更多物体)")
 args = parser.parse_args()
 
 # ── 摄像头 ──
@@ -101,35 +101,52 @@ while True:
     h, w = frame.shape[:2]
     frame_count += 1
 
-    # ── YOLO 物体检测（每 2 帧，M4 32GB 跑得动）──
-    if yolo_enabled and yolo and frame_count % 2 == 0:
+    # ── YOLO 物体检测（每帧都跑，M4 32GB 性能充足）──
+    if yolo_enabled and yolo:
         yolo_results = yolo(frame, verbose=False, conf=args.conf)
 
-    # 类别配色表（按语义分组）
+    # 类别配色表（全 80 类 COCO 按语义分 10 组）
     CATEGORY_COLORS = {
-        "person": (50, 200, 50),      # 绿
-        "chair": (200, 150, 50),      # 蓝金
-        "couch": (200, 150, 50),
-        "bed": (200, 150, 50),
-        "dining table": (200, 150, 50),
-        "desk": (200, 150, 50),
-        "tv": (255, 100, 100),        # 浅红（电子设备）
-        "laptop": (255, 100, 100),
-        "cell phone": (255, 100, 100),
-        "keyboard": (255, 100, 100),
-        "mouse": (255, 100, 100),
-        "remote": (255, 100, 100),
-        "monitor": (255, 100, 100),
-        "cup": (100, 200, 255),       # 浅蓝（日用品）
-        "bottle": (100, 200, 255),
-        "book": (100, 200, 255),
-        "clock": (100, 200, 255),
-        "vase": (100, 200, 255),
-        "scissors": (100, 200, 255),
-        "backpack": (180, 100, 255),  # 紫（随身物品）
-        "handbag": (180, 100, 255),
-        "umbrella": (180, 100, 255),
-        "suitcase": (180, 100, 255),
+        # 人（绿色系）
+        "person": (50, 200, 50),
+        # 家具（蓝金）
+        "chair": (200, 150, 50), "couch": (200, 150, 50), "bed": (200, 150, 50),
+        "dining table": (200, 150, 50), "toilet": (200, 150, 50), "potted plant": (200, 150, 50),
+        # 电子设备（浅红）
+        "tv": (255, 100, 100), "laptop": (255, 100, 100), "cell phone": (255, 100, 100),
+        "keyboard": (255, 100, 100), "mouse": (255, 100, 100), "remote": (255, 100, 100),
+        "microwave": (255, 100, 100), "oven": (255, 100, 100), "toaster": (255, 100, 100),
+        "refrigerator": (255, 100, 100),
+        # 日用品（浅蓝）
+        "cup": (100, 200, 255), "bottle": (100, 200, 255), "book": (100, 200, 255),
+        "clock": (100, 200, 255), "vase": (100, 200, 255), "scissors": (100, 200, 255),
+        "teddy bear": (100, 200, 255), "hair drier": (100, 200, 255), "toothbrush": (100, 200, 255),
+        # 随身物品（紫色）
+        "backpack": (180, 100, 255), "handbag": (180, 100, 255), "umbrella": (180, 100, 255),
+        "suitcase": (180, 100, 255), "tie": (180, 100, 255),
+        # 食物（橙色）
+        "banana": (50, 150, 255), "apple": (50, 150, 255), "sandwich": (50, 150, 255),
+        "orange": (50, 150, 255), "broccoli": (50, 150, 255), "carrot": (50, 150, 255),
+        "hot dog": (50, 150, 255), "pizza": (50, 150, 255), "donut": (50, 150, 255),
+        "cake": (50, 150, 255), "wine glass": (50, 150, 255), "fork": (50, 150, 255),
+        "knife": (50, 150, 255), "spoon": (50, 150, 255), "bowl": (50, 150, 255),
+        # 交通工具（青色）
+        "car": (255, 200, 50), "bicycle": (255, 200, 50), "motorcycle": (255, 200, 50),
+        "airplane": (255, 200, 50), "bus": (255, 200, 50), "train": (255, 200, 50),
+        "truck": (255, 200, 50), "boat": (255, 200, 50),
+        # 动物（粉红）
+        "cat": (200, 100, 200), "dog": (200, 100, 200), "horse": (200, 100, 200),
+        "sheep": (200, 100, 200), "cow": (200, 100, 200), "elephant": (200, 100, 200),
+        "bear": (200, 100, 200), "zebra": (200, 100, 200), "giraffe": (200, 100, 200),
+        "bird": (200, 100, 200),
+        # 运动（亮黄）
+        "frisbee": (0, 255, 255), "skis": (0, 255, 255), "snowboard": (0, 255, 255),
+        "sports ball": (0, 255, 255), "kite": (0, 255, 255), "baseball bat": (0, 255, 255),
+        "baseball glove": (0, 255, 255), "skateboard": (0, 255, 255), "surfboard": (0, 255, 255),
+        "tennis racket": (0, 255, 255),
+        # 交通标志（白色）
+        "traffic light": (220, 220, 220), "fire hydrant": (220, 220, 220),
+        "stop sign": (220, 220, 220), "parking meter": (220, 220, 220), "bench": (220, 220, 220),
     }
     DEFAULT_COLOR = (200, 200, 100)   # 其他类别：浅黄
 
@@ -145,13 +162,28 @@ while True:
                 # 统计物体数量
                 obj_count[label] = obj_count.get(label, 0) + 1
 
-                # 画框 + 标签（半透明背景增强可读性）
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                # 计算物体尺寸和面积占比
+                obj_w = x2 - x1
+                obj_h = y2 - y1
+                area_pct = (obj_w * obj_h) / (w * h) * 100
+
+                # 画框（大物体粗框，小物体细框）
+                thickness = 3 if area_pct > 5 else 2
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+                # 主标签：类别 + 置信度
                 txt = f"{label} {conf:.0%}"
                 (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                 cv2.putText(frame, txt, (x1 + 2, y1 - 4),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+                # 副标签：尺寸 + 面积占比（框底部）
+                size_txt = f"{obj_w}x{obj_h} ({area_pct:.1f}%)"
+                (sw, sh), _ = cv2.getTextSize(size_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                cv2.rectangle(frame, (x1, y2), (x1 + sw + 4, y2 + sh + 4), color, -1)
+                cv2.putText(frame, size_txt, (x1 + 2, y2 + sh + 2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
 
     # 右下角物体统计面板
     if yolo_enabled and obj_count:
