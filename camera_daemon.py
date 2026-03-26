@@ -67,12 +67,18 @@ def log_event(event_type: str, detail: str = ""):
 
 
 def init_vision_model() -> Optional["VisionModel"]:
-    """尝试初始化本地多模态视觉模型"""
+    """尝试初始化本地多模态视觉模型（优先 minicpm-v，降级 moondream）"""
     try:
         from vision_models import VisionModel
+        # 优先用 minicpm-v（8B，更准确）
+        vm = VisionModel(mode="balanced")
+        if vm.is_available:
+            print(f"[cc-eye daemon] 视觉模型就绪: {vm.model}（均衡模式）")
+            return vm
+        # 降级到 moondream（1.6B，更快）
         vm = VisionModel(mode="fast")
         if vm.is_available:
-            print("[cc-eye daemon] 视觉模型就绪（moondream）")
+            print(f"[cc-eye daemon] 视觉模型就绪: {vm.model}（快速模式）")
             return vm
         print("[cc-eye daemon] 视觉模型不可用，仅运行基础检测")
         return None
