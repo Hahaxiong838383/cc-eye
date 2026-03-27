@@ -88,14 +88,18 @@ def init_vision_model() -> Optional["VisionModel"]:
 
 
 def describe_scene(vm: "VisionModel") -> Optional[str]:
-    """用本地模型描述当前场景"""
-    prompt = (
-        "Describe this scene concisely: "
-        "1) People present and what they're doing "
-        "2) Notable objects on desk/in room "
-        "3) Any changes or unusual things. "
-        "Be brief, 2-3 sentences max."
-    )
+    """用本地模型以 cc 分身的视角描述场景"""
+    try:
+        from cc_context import build_vision_prompt
+        prompt = build_vision_prompt()
+    except ImportError:
+        prompt = (
+            "Describe this scene concisely: "
+            "1) People present and what they're doing "
+            "2) Notable objects on desk/in room "
+            "3) Any changes or unusual things. "
+            "Be brief, 2-3 sentences max."
+        )
     return vm.describe_camera(prompt)
 
 
