@@ -25,13 +25,15 @@ from datetime import datetime
 from typing import Optional
 
 # ── 配置 ────────────────────────────────────
-CAPTURE_INTERVAL = 5        # 秒，拍摄间隔
+CAPTURE_INTERVAL = 3        # 秒，拍摄间隔（提速）
 LATEST_FRAME_PATH = "/tmp/cc-eye-latest.jpg"
 EVENTS_PATH = "/tmp/cc-eye-events.jsonl"
 SCENE_PATH = "/tmp/cc-eye-scene.json"
 MOTION_THRESHOLD = 8.0      # 帧差均值 > 此值 → 有运动
 FACE_CHECK_INTERVAL = 2     # 每 N 次拍摄做一次人脸检测
-SCENE_DESCRIBE_INTERVAL = 60  # 秒，场景描述间隔（每分钟一次）
+# 双模型策略：moondream 快扫 + minicpm-v 事件精确分析
+FAST_SCAN_INTERVAL = 10     # 秒，moondream 快速扫描间隔
+DETAIL_SCAN_INTERVAL = 120  # 秒，minicpm-v 定时精扫间隔
 MAX_EVENTS = 200            # 事件文件最大行数（自动滚动）
 
 # ── 初始化 ────────────────────────────────────
@@ -66,29 +68,44 @@ def log_event(event_type: str, detail: str = ""):
         events_file.write_text("\n".join(lines[-MAX_EVENTS:]) + "\n")
 
 
-def init_vision_model() -> Optional["VisionModel"]:
-    """尝试初始化本地多模态视觉模型（优先 minicpm-v，降级 moondream）"""
+def init_vision_models() -> tuple:
+    """
+    初始化双模型：moondream（快扫）+ minicpm-v（精确分析）。
+    返回 (fast_model, detail_model)，不可用的为 None。
+    """
+    fast_model = None
+    detail_model = None
     try:
         from vision_models import VisionModel
-        # 优先用 minicpm-v（8B，更准确）
-        vm = VisionModel(mode="balanced")
-        if vm.is_available:
-            print(f"[cc-eye daemon] 视觉模型就绪: {vm.model}（均衡模式）")
-            return vm
-        # 降级到 moondream（1.6B，更快）
-        vm = VisionModel(mode="fast")
-        if vm.is_available:
-            print(f"[cc-eye daemon] 视觉模型就绪: {vm.model}（快速模式）")
-            return vm
-        print("[cc-eye daemon] 视觉模型不可用，仅运行基础检测")
-        return None
+        # 快速模型（moondream 1.6B，~2s 响应）
+        vm_fast = VisionModel(mode="fast")
+        if vm_fast.is_available:
+            fast_model = vm_fast
+            print(f"[cc-eye daemon] 快扫模型就绪: {vm_fast.model}")
+        # 精确模型（minicpm-v 8B，~8s 响应）
+        vm_detail = VisionModel(mode="balanced")
+        if vm_detail.is_available:
+            detail_model = vm_detail
+            print(f"[cc-eye daemon] 精扫模型就绪: {vm_detail.model}")
+        if not fast_model and not detail_model:
+            print("[cc-eye daemon] 视觉模型不可用，仅运行基础检测")
     except Exception as e:
         print(f"[cc-eye daemon] 视觉模型加载失败: {e}")
-        return None
+    return fast_model, detail_model
 
 
-def describe_scene(vm: "VisionModel") -> Optional[str]:
-    """用本地模型以 cc 分身的视角描述场景"""
+FAST_SCAN_PROMPT = (
+    "Describe what you see briefly: "
+    "1) Is anyone present? What are they doing? "
+    "2) Key objects visible. "
+    "One sentence max."
+)
+
+
+def describe_scene(vm: "VisionModel", use_english: bool = False) -> Optional[str]:
+    """用本地模型描述场景。moondream 用英文 prompt，minicpm-v 用中文。"""
+    if use_english:
+        return vm.describe_camera(FAST_SCAN_PROMPT)
     try:
         from cc_context import build_vision_prompt
         prompt = build_vision_prompt()
@@ -116,9 +133,10 @@ def save_scene(description: str, face_count: int) -> None:
 
 
 def main():
-    print(f"[cc-eye daemon] 启动摄像头服务...")
+    print(f"[cc-eye daemon] 启动摄像头服务（双模型策略）...")
     print(f"  拍摄间隔: {CAPTURE_INTERVAL}s")
-    print(f"  场景描述间隔: {SCENE_DESCRIBE_INTERVAL}s")
+    print(f"  快扫间隔: {FAST_SCAN_INTERVAL}s (moondream)")
+    print(f"  精扫间隔: {DETAIL_SCAN_INTERVAL}s (minicpm-v)")
     print(f"  最新帧: {LATEST_FRAME_PATH}")
     print(f"  事件日志: {EVENTS_PATH}")
     print(f"  场景描述: {SCENE_PATH}")
@@ -137,15 +155,17 @@ def main():
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
 
-    # 视觉模型（可选）
-    vision_model = init_vision_model()
+    # 双模型初始化
+    fast_model, detail_model = init_vision_models()
 
     prev_gray = None
     prev_face_count = 0
     frame_count = 0
-    last_scene_time = 0.0
+    last_fast_scan_time = 0.0
+    last_detail_scan_time = 0.0
+    pending_detail_scan = False  # 事件触发的精确分析标记
 
-    log_event("daemon_start", "摄像头服务启动")
+    log_event("daemon_start", "摄像头服务启动（双模型策略）")
     print("[cc-eye daemon] 运行中... Ctrl+C 停止")
 
     try:
@@ -172,6 +192,9 @@ def main():
 
                 if mean_diff > MOTION_THRESHOLD:
                     log_event("motion", f"diff={mean_diff:.1f}")
+                    # 大幅运动触发精确分析
+                    if mean_diff > MOTION_THRESHOLD * 2:
+                        pending_detail_scan = True
 
             prev_gray = gray
 
@@ -186,25 +209,41 @@ def main():
                 if face_count > 0 and prev_face_count == 0:
                     log_event("person_appeared", f"检测到 {face_count} 张脸")
                     print(f"[cc-eye daemon] 有人来了！({face_count} 张脸)")
-                    # 写入信号文件，cc 下次对话时能感知到
                     Path("/tmp/cc-eye-person-arrived.flag").write_text(
                         datetime.now().isoformat()
                     )
+                    # 有人出现 → 立即触发精确分析
+                    pending_detail_scan = True
                 elif face_count == 0 and prev_face_count > 0:
                     log_event("person_left", "画面中无人")
                     print("[cc-eye daemon] 人走了")
 
                 prev_face_count = face_count
 
-            # ── 场景描述（定时用本地模型看一眼）──
             now = time.time()
-            if vision_model and (now - last_scene_time) >= SCENE_DESCRIBE_INTERVAL:
-                last_scene_time = now
-                desc = describe_scene(vision_model)
+
+            # ── moondream 快扫（每 10s，轻量级）──
+            if fast_model and (now - last_fast_scan_time) >= FAST_SCAN_INTERVAL:
+                last_fast_scan_time = now
+                desc = describe_scene(fast_model, use_english=True)
                 if desc:
                     save_scene(desc, prev_face_count)
-                    log_event("scene_described", desc[:100])
-                    print(f"[cc-eye daemon] 场景: {desc[:80]}...")
+                    log_event("fast_scan", desc[:100])
+                    print(f"[cc-eye daemon] 快扫: {desc[:60]}...")
+
+            # ── minicpm-v 精扫（事件触发 或 定时 120s）──
+            should_detail = (
+                pending_detail_scan
+                or (detail_model and (now - last_detail_scan_time) >= DETAIL_SCAN_INTERVAL)
+            )
+            if detail_model and should_detail:
+                last_detail_scan_time = now
+                pending_detail_scan = False
+                desc = describe_scene(detail_model)
+                if desc:
+                    save_scene(desc, prev_face_count)
+                    log_event("detail_scan", desc[:100])
+                    print(f"[cc-eye daemon] 精扫: {desc[:80]}...")
 
             time.sleep(CAPTURE_INTERVAL)
 

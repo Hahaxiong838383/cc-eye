@@ -23,3 +23,9 @@ face_data/*.npy
 .idea/
 .vscode/
 *.swp
+
+# 环境变量（含 API Key）
+.env
+
+# 人脸照片和模型（隐私敏感）
+faces/
