@@ -308,25 +308,27 @@ class CcInteract:
 
     def _time_aware_greeting(self) -> None:
         """基于时间的智能问候：本地秒回 + 云端补充"""
+        import random
         from datetime import datetime
         hour = datetime.now().hour
-        if hour < 6:
-            period = "凌晨了还在忙"
-        elif hour < 9:
-            period = "早上好"
-        elif hour < 12:
-            period = "上午好"
-        elif hour < 14:
-            period = "中午好"
-        elif hour < 18:
-            period = "下午好"
-        elif hour < 22:
-            period = "晚上好"
-        else:
-            period = "夜深了"
 
-        # 第一句：本地固定短句，秒出（不等网络）
-        self._enqueue_speak(f"川哥{period}，贾维斯在线。")
+        # 多种问候模板，随机选一种，避免每次一样
+        if hour < 6:
+            greetings = ["这么晚还在忙？", "凌晨了，注意休息。", "夜猫子模式？"]
+        elif hour < 9:
+            greetings = ["早。", "起了？", "早上好。"]
+        elif hour < 12:
+            greetings = ["在的。", "上午好。", "嗯，随时待命。"]
+        elif hour < 14:
+            greetings = ["中午好。", "吃了吗？", "午休时间到了。"]
+        elif hour < 18:
+            greetings = ["下午好。", "在的。", "继续？"]
+        elif hour < 22:
+            greetings = ["晚上好。", "在。", "还在忙？"]
+        else:
+            greetings = ["夜深了。", "还没休息？", "在的。"]
+
+        self._enqueue_speak(random.choice(greetings))
 
         # 第二句：Gemini 结合视觉场景生成（异步，自然衔接）
         def _gen_scene_comment():

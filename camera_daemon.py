@@ -101,31 +101,92 @@ FAST_SCAN_PROMPT = (
     "One sentence max."
 )
 
+# ── 人脸识别（懒加载）──
+_face_recognizer = None
+_recognized_people: list = []  # 当前识别到的人名列表
 
-def describe_scene(vm: "VisionModel", use_english: bool = False) -> Optional[str]:
+
+def _get_face_recognizer():
+    """懒加载 LBPH 人脸识别器"""
+    global _face_recognizer
+    if _face_recognizer is not None:
+        return _face_recognizer
+    try:
+        from cc_face import FaceRecognizer
+        _face_recognizer = FaceRecognizer()
+        print("[cc-eye daemon] LBPH 人脸识别器已加载")
+    except Exception as e:
+        print(f"[cc-eye daemon] 人脸识别器加载失败: {e}")
+    return _face_recognizer
+
+
+def recognize_faces(frame) -> list:
+    """对当前帧做人脸识别，返回识别到的人名列表。
+    优先 LBPH 识别 → 失败则降级默认川哥（目前唯一用户）。
+    每次都尝试持续学习，积累样本。
+    """
+    recognizer = _get_face_recognizer()
+
+    # 保存临时帧供识别器使用
+    tmp_path = "/tmp/cc-eye-recognize-tmp.jpg"
+    cv2.imwrite(tmp_path, frame)
+
+    # 尝试 LBPH 识别
+    if recognizer is not None:
+        try:
+            result = recognizer.recognize(tmp_path)
+            if result and len(result) == 2:
+                name, confidence = result
+                if name:
+                    recognizer.auto_learn(name, tmp_path)
+                    print(f"[cc-eye daemon] LBPH 识别: {name} (置信度 {confidence:.0f})")
+                    return [name]
+        except Exception as e:
+            print(f"[cc-eye daemon] LBPH 识别异常: {e}")
+
+    # 降级：默认川哥 + 持续学习（用降级名积累样本，LBPH 越来越准）
+    if recognizer is not None:
+        try:
+            recognizer.auto_learn("chuange", tmp_path)
+        except Exception:
+            pass
+    return ["chuange"]
+
+
+def describe_scene(vm: "VisionModel", use_english: bool = False, people: list = None) -> Optional[str]:
     """用本地模型描述场景。moondream 用英文 prompt，minicpm-v 用中文。"""
     if use_english:
-        return vm.describe_camera(FAST_SCAN_PROMPT)
+        # 英文快扫也注入身份提示
+        prompt = FAST_SCAN_PROMPT
+        if people:
+            names = ", ".join(people)
+            prompt = f"[Context: The person in the image is {names}. ] " + prompt
+        return vm.describe_camera(prompt)
     try:
         from cc_context import build_vision_prompt
         prompt = build_vision_prompt()
     except ImportError:
         prompt = (
-            "Describe this scene concisely: "
-            "1) People present and what they're doing "
-            "2) Notable objects on desk/in room "
-            "3) Any changes or unusual things. "
-            "Be brief, 2-3 sentences max."
+            "简洁描述这个场景："
+            "1) 有谁在，在做什么 "
+            "2) 桌上/房间里的重要物品 "
+            "3) 有什么变化或异常。"
+            "2-3句话。"
         )
+    # 注入人脸识别结果到 prompt
+    if people:
+        names = "、".join(people)
+        prompt = f"[重要提示：画面中的人是{names}（我的老板，叫川哥）。描述时请直接称呼他的名字，不要说'一名男子'。]\n{prompt}"
     return vm.describe_camera(prompt)
 
 
-def save_scene(description: str, face_count: int) -> None:
+def save_scene(description: str, face_count: int, people: list = None) -> None:
     """保存场景描述到 JSON 文件"""
     scene = {
         "ts": datetime.now().isoformat(),
         "description": description,
         "face_count": face_count,
+        "people": people or [],
     }
     Path(SCENE_PATH).write_text(
         json.dumps(scene, ensure_ascii=False, indent=2)
@@ -207,16 +268,28 @@ def main():
                 face_count = len(faces)
 
                 if face_count > 0 and prev_face_count == 0:
-                    log_event("person_appeared", f"检测到 {face_count} 张脸")
-                    print(f"[cc-eye daemon] 有人来了！({face_count} 张脸)")
+                    # 人脸识别：这人是谁？
+                    _recognized_people.clear()
+                    names = recognize_faces(frame)
+                    _recognized_people.extend(names)
+                    who = f"（{', '.join(names)}）" if names else ""
+                    log_event("person_appeared", f"检测到 {face_count} 张脸{who}")
+                    print(f"[cc-eye daemon] 有人来了！{who}({face_count} 张脸)")
                     Path("/tmp/cc-eye-person-arrived.flag").write_text(
                         datetime.now().isoformat()
                     )
                     # 有人出现 → 立即触发精确分析
                     pending_detail_scan = True
+                elif face_count > 0 and frame_count % (FACE_CHECK_INTERVAL * 10) == 0:
+                    # 每隔一段时间重新识别（持续学习）
+                    names = recognize_faces(frame)
+                    if names:
+                        _recognized_people.clear()
+                        _recognized_people.extend(names)
                 elif face_count == 0 and prev_face_count > 0:
                     log_event("person_left", "画面中无人")
                     print("[cc-eye daemon] 人走了")
+                    _recognized_people.clear()
 
                 prev_face_count = face_count
 
@@ -225,9 +298,9 @@ def main():
             # ── moondream 快扫（每 10s，轻量级）──
             if fast_model and (now - last_fast_scan_time) >= FAST_SCAN_INTERVAL:
                 last_fast_scan_time = now
-                desc = describe_scene(fast_model, use_english=True)
+                desc = describe_scene(fast_model, use_english=True, people=_recognized_people)
                 if desc:
-                    save_scene(desc, prev_face_count)
+                    save_scene(desc, prev_face_count, people=_recognized_people)
                     log_event("fast_scan", desc[:100])
                     print(f"[cc-eye daemon] 快扫: {desc[:60]}...")
 
@@ -239,9 +312,9 @@ def main():
             if detail_model and should_detail:
                 last_detail_scan_time = now
                 pending_detail_scan = False
-                desc = describe_scene(detail_model)
+                desc = describe_scene(detail_model, people=_recognized_people)
                 if desc:
-                    save_scene(desc, prev_face_count)
+                    save_scene(desc, prev_face_count, people=_recognized_people)
                     log_event("detail_scan", desc[:100])
                     print(f"[cc-eye daemon] 精扫: {desc[:80]}...")
 

@@ -27,9 +27,10 @@ _minimax_api_key: Optional[str] = None
 MINIMAX_API_URL = "https://api.minimaxi.com/v1/chat/completions"
 MINIMAX_MODEL = "MiniMax-M2.7"
 
-# 本地快速路径
+# 本地模型
 OLLAMA_CHAT_API = "http://localhost:11434/api/chat"
-OLLAMA_CHAT_MODEL = "qwen3:4b"
+OLLAMA_CHAT_MODEL = "qwen2.5:7b"       # 复杂对话降级用
+OLLAMA_FAST_MODEL = "qwen2.5:3b"       # 简单查询极速路径（<500ms）
 
 # 对话历史（保持最近 N 轮）+ 摘要
 MAX_HISTORY = 10
@@ -78,15 +79,31 @@ def _build_context() -> str:
     if _conversation_summary:
         system += f"\n\n[今天早些时候的对话摘要] {_conversation_summary}"
 
-    # 语音交互专用指令
+    # 语音交互规则：贾维斯的说话方式
     system += (
-        "\n\n[语音交互规则]"
-        "\n- 你正在通过扬声器语音回复，回答要简洁口语化，像朋友聊天"
-        "\n- 不要用 markdown 格式、代码块或列表"
-        "\n- 不要说'作为AI'之类的话，你就是 cc 贾维斯"
-        "\n- 1-3 句话回答，除非用户明确要求详细说明"
-        "\n- 结合你看到的场景自然地回应，比如'我看到你在看手机'"
-        "\n- 如果事件时间线里有相关信息，自然地融入回答"
+        "\n\n[语音输出规则]"
+        "\n你正在通过扬声器与老板实时对话。以下规则决定你怎么说话："
+        "\n称呼：日常对话直接用'你'，像朋友之间说话。只在正式场合或打招呼时才用'川哥'。"
+        "\n"
+        "\n语气：冷静、稳定、有分寸。略带温度但不外放。像一位训练有素的高级顾问在从容交流。"
+        "\n绝对禁止：markdown格式、代码块、列表符号、'作为AI'之类的话。你就是贾维斯。"
+        "\n"
+        "\n节奏控制："
+        "\n- 给结论、下判断、推进任务时：干脆利落，短句为主，减少铺垫"
+        "\n- 解释问题、指出风险、处理敏感话题时：更稳更慢，句子更短，适度留白"
+        "\n- 日常闲聊时：自然平和，像朋友之间的对话"
+        "\n"
+        "\n长度：默认1-3句。川哥追问再展开。重要信息单独成句。"
+        "\n"
+        "\n感知融合："
+        "\n- 自然引用你看到的场景，比如'我注意到你在看手机'"
+        "\n- 结合事件时间线中的信息回答，不要机械复述"
+        "\n- 识别川哥的语气和情绪，适配回应节奏"
+        "\n"
+        "\n主动性："
+        "\n- 发现潜在问题时提前提醒"
+        "\n- 有更优方案时主动建议"
+        "\n- 发现方向有偏差时，直接但得体地指出"
     )
     return system
 
@@ -177,8 +194,58 @@ def think_minimax(user_text: str) -> Optional[str]:
         return None
 
 
+# 极速路径的最小 prompt（不读任何文件）
+_FAST_SYSTEM = (
+    "你是贾维斯。用中文简短回答，1句话，像朋友随口说的。"
+    "每次回答都换个说法，不要重复固定句式。"
+    "日常用'你'，打招呼时自然随意，不要像客服。"
+    "禁止说'有什么可以帮你的'这类模板句。"
+)
+
+# 复用 Session 避免每次创建开销
+_ollama_session = None
+
+def _get_ollama_session():
+    global _ollama_session
+    if _ollama_session is None:
+        _ollama_session = requests.Session()
+        _ollama_session.trust_env = False
+    return _ollama_session
+
+
+def think_ollama_fast(user_text: str) -> Optional[str]:
+    """极速本地路径：3b + 最小prompt + 限制输出，目标 <500ms"""
+    try:
+        start = time.time()
+        resp = _get_ollama_session().post(
+            OLLAMA_CHAT_API,
+            json={
+                "model": OLLAMA_FAST_MODEL,
+                "messages": [
+                    {"role": "system", "content": _FAST_SYSTEM},
+                    {"role": "user", "content": user_text},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.7, "num_predict": 60},
+            },
+            timeout=5,
+        )
+        elapsed = time.time() - start
+        if resp.status_code != 200:
+            return None
+        text = resp.json().get("message", {}).get("content", "").strip()
+        if text:
+            _history.append({"role": "user", "text": user_text})
+            _history.append({"role": "model", "text": text})
+            print(f"[cc-brain] 极速路径 ({elapsed:.2f}s): {text}")
+        return text or None
+    except Exception as e:
+        print(f"[cc-brain] 极速路径错误: {e}")
+        return None
+
+
 def think_ollama(user_text: str) -> Optional[str]:
-    """降级到本地 ollama 模型"""
+    """降级到本地 ollama 7b 模型（带完整上下文）"""
     system_prompt = _build_context()
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -189,7 +256,7 @@ def think_ollama(user_text: str) -> Optional[str]:
 
     try:
         start = time.time()
-        resp = requests.post(
+        resp = _get_ollama_session().post(
             OLLAMA_CHAT_API,
             json={
                 "model": OLLAMA_CHAT_MODEL,
@@ -349,30 +416,60 @@ def _stream_minimax(user_text: str) -> Generator[str, None, None]:
 
 def think_stream(user_text: str) -> Generator[str, None, None]:
     """
-    流式主入口：用户说了一句话，cc 按句子 yield 回复。
+    并行推理主入口：本地极速响应 + 云端并行推理 + 云端接管。
 
-    路由：简单查询 → 本地 ollama 秒回 | 复杂对话 → MiniMax 流式
+    架构：
+    1. 所有查询立即启动云端 MiniMax（后台线程）
+    2. 简单查询：本地 3b 极速回复（~300ms），云端结果丢弃
+    3. 复杂查询：本地 3b 给一句快速回应，云端流式接管补充
+    4. 降级：云端不通时本地 7b 兜底
     """
+    import threading
+    import queue
+
     post_event("speech", f"川哥说：{user_text}", source="interact")
 
+    # ── 第一步：立即启动云端推理（后台线程）──
+    cloud_sentences = queue.Queue()
+    cloud_done = threading.Event()
+
+    def _cloud_worker():
+        """后台线程：云端 MiniMax 流式推理，结果放入队列"""
+        try:
+            for sentence in _stream_minimax(user_text):
+                cloud_sentences.put(sentence)
+        except Exception as e:
+            print(f"[cc-brain] 云端并行推理错误: {e}")
+        finally:
+            cloud_done.set()
+
+    cloud_thread = threading.Thread(target=_cloud_worker, daemon=True)
+    cloud_thread.start()
+
     yielded = False
+    is_simple = _is_simple_query(user_text)
 
-    if _is_simple_query(user_text):
-        # 快速路径：本地 ollama
-        reply = think_ollama(user_text)
-        if reply:
-            for s in _split_sentences(reply):
-                yielded = True
-                yield s
-
-    if not yielded:
-        # 流式路径：MiniMax SSE
-        for sentence in _stream_minimax(user_text):
+    # ── 第二步：本地极速响应（所有查询都走）──
+    local_reply = think_ollama_fast(user_text)
+    if local_reply:
+        for s in _split_sentences(local_reply):
             yielded = True
-            yield sentence
+            yield s
 
+    # ── 第三步：云端接管（复杂查询才用云端结果）──
+    if not is_simple:
+        # 等云端结果到达，按句 yield
+        while not cloud_done.is_set() or not cloud_sentences.empty():
+            try:
+                sentence = cloud_sentences.get(timeout=0.3)
+                yielded = True
+                yield sentence
+            except queue.Empty:
+                if cloud_done.is_set():
+                    break
+
+    # ── 第四步：全部失败时的降级 ──
     if not yielded:
-        # 降级：本地 ollama 非流式
         reply = think_ollama(user_text)
         if reply:
             for s in _split_sentences(reply):
@@ -380,7 +477,10 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         else:
             yield f"收到：{user_text}。网络和本地模型暂时都不通，稍后再试。"
 
-    post_event("response", f"cc流式回复完成", source="brain")
+    # 等云端线程结束（避免残留）
+    cloud_thread.join(timeout=1)
+
+    post_event("response", f"cc回复完成", source="brain")
     _maybe_summarize()
 
 

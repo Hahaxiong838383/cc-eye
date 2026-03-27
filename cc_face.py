@@ -76,7 +76,7 @@ class FaceRecognizer:
         """检测图像中的人脸，返回 [(x,y,w,h), ...]"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         faces = self._face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+            gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40)
         )
         return faces, gray
 
