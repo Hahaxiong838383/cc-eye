@@ -22,11 +22,8 @@ def _get_engine() -> pyttsx3.Engine:
         _engine = pyttsx3.init()
         _engine.setProperty('rate', 160)
         _engine.setProperty('volume', 1.0)
-        # 选择中文语音
-        for v in _engine.getProperty('voices'):
-            if 'zh' in v.id.lower() or 'chinese' in v.name.lower():
-                _engine.setProperty('voice', v.id)
-                break
+        # 贾维斯风格：Reed 中文男声（沉稳低沉）
+        _engine.setProperty('voice', 'com.apple.eloquence.zh-CN.Reed')
     return _engine
 
 
