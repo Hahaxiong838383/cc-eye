@@ -29,6 +29,18 @@ class VisionModel:
         "balanced": "minicpm-v",      # 8B，均衡
     }
 
+    # 模型原生输入尺寸（长边最大值）— 超过此值的像素纯属浪费
+    MAX_DIMS = {
+        "moondream": 384,             # SigLIP encoder 378×378
+        "minicpm-v": 448,             # InternViT 448×448
+    }
+
+    # 发给模型的 JPEG 质量 — 低于此值影响识别
+    JPEG_QUALITY = {
+        "moondream": 65,
+        "minicpm-v": 75,
+    }
+
     def __init__(self, mode: str = "fast"):
         self.model = self.MODELS.get(mode, self.MODELS["fast"])
         self._available = self._check_available()
@@ -52,6 +64,38 @@ class VisionModel:
     def is_available(self) -> bool:
         return self._available
 
+    def _prepare_image(self, image_path: str) -> Optional[str]:
+        """Resize 到模型原生尺寸 + 降 JPEG 质量，返回 base64。
+
+        moondream 内部用 378×378，minicpm-v 用 448×448。
+        发 1280×720 的图过去全是浪费 — 编码慢、传输慢、模型还得再缩。
+        """
+        try:
+            import cv2
+            img = cv2.imread(image_path)
+            if img is None:
+                return None
+
+            max_dim = self.MAX_DIMS.get(self.model, 384)
+            h, w = img.shape[:2]
+
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            quality = self.JPEG_QUALITY.get(self.model, 70)
+            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            return base64.b64encode(buf.tobytes()).decode("utf-8")
+        except Exception as e:
+            logger.error(f"图片预处理失败: {e}")
+            # 降级：原始文件直接读取
+            try:
+                with open(image_path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+            except Exception:
+                return None
+
     def describe_image(self, image_path: str, prompt: str = "Describe what you see in this image in detail.") -> Optional[str]:
         """
         让本地模型描述一张图片。
@@ -69,8 +113,9 @@ class VisionModel:
                 return None
 
         try:
-            with open(image_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            img_b64 = self._prepare_image(image_path)
+            if not img_b64:
+                return None
 
             start = time.time()
             resp = requests.post(

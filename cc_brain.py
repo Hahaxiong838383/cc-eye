@@ -18,6 +18,32 @@ from pathlib import Path
 
 from cc_context import build_system_prompt, get_scene_context
 from cc_events import get_context_window, post_event
+from cc_tools import try_tool
+
+# ── 交互日志（自学习数据采集）──
+_INTERACTION_LOG = Path("/tmp/cc-eye-interactions.jsonl")
+
+def _log_interaction(user_text: str, route: str, local_reply: str, cloud_reply: str, latency: float):
+    """记录每次交互，供进化自查分析"""
+    from datetime import datetime
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "input": user_text[:100],
+        "route": route,  # "simple_local" | "complex_parallel" | "fallback"
+        "local_reply": (local_reply or "")[:80],
+        "cloud_reply": (cloud_reply or "")[:80],
+        "latency_ms": int(latency * 1000),
+    }
+    try:
+        with open(_INTERACTION_LOG, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # 滚动保留最近 200 条
+        lines = _INTERACTION_LOG.read_text().strip().split("\n")
+        if len(lines) > 200:
+            _INTERACTION_LOG.write_text("\n".join(lines[-200:]) + "\n")
+    except Exception:
+        pass
+
 
 # ── API 配置 ──
 # FUTURUS 大脑（兼容 OpenAI 协议）
@@ -426,8 +452,26 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     """
     import threading
     import queue
+    import random
+
+    start_time = time.time()
 
     post_event("speech", f"川哥说：{user_text}", source="interact")
+
+    # 输入过滤：去掉标点后太短的直接丢弃
+    clean_input = re.sub(r'[。？！，、；：\u201c\u201d\u2018\u2019（）\s]', '', user_text)
+    if len(clean_input) < 2:
+        yield "嗯？"
+        post_event("response", "cc回复完成（输入过短）", source="brain")
+        return
+
+    # ── 工具调用检测（优先于 LLM）──
+    tool_result = try_tool(user_text)
+    if tool_result:
+        yield tool_result
+        _log_interaction(user_text, "tool", tool_result, "", time.time() - start_time)
+        post_event("response", f"工具调用: {tool_result[:30]}", source="brain")
+        return
 
     # ── 第一步：立即启动云端推理（后台线程）──
     cloud_sentences = queue.Queue()
@@ -449,12 +493,21 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     yielded = False
     is_simple = _is_simple_query(user_text)
 
-    # ── 第二步：本地极速响应（所有查询都走）──
-    local_reply = think_ollama_fast(user_text)
-    if local_reply:
-        for s in _split_sentences(local_reply):
-            yielded = True
-            yield s
+    # ── 第二步：本地极速响应 ──
+    local_reply = None
+    filler = None
+    if is_simple:
+        local_reply = think_ollama_fast(user_text)
+        if local_reply:
+            for s in _split_sentences(local_reply):
+                yielded = True
+                yield s
+    else:
+        # 复杂查询：本地给极短占位应答，让云端接管
+        fillers = ["嗯，让我想想。", "好，稍等。", "收到。", "明白。"]
+        filler = random.choice(fillers)
+        yielded = True
+        yield filler
 
     # ── 第三步：云端接管（复杂查询才用云端结果）──
     if not is_simple:
@@ -462,6 +515,9 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         while not cloud_done.is_set() or not cloud_sentences.empty():
             try:
                 sentence = cloud_sentences.get(timeout=0.3)
+                # 云端质量门控：丢弃残句和过短回复
+                if len(sentence.strip()) < 5 or sentence.strip().endswith(('吧。', '的。', '了。')) and len(sentence.strip()) < 8:
+                    continue
                 yielded = True
                 yield sentence
             except queue.Empty:
@@ -479,6 +535,15 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
 
     # 等云端线程结束（避免残留）
     cloud_thread.join(timeout=1)
+
+    # ── 第五步：交互日志（自学习数据采集）──
+    _log_interaction(
+        user_text=user_text,
+        route="simple_local" if is_simple else "complex_parallel",
+        local_reply=local_reply or filler or "",
+        cloud_reply="(streamed)",
+        latency=time.time() - start_time,
+    )
 
     post_event("response", f"cc回复完成", source="brain")
     _maybe_summarize()
