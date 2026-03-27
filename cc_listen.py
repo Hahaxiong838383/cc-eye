@@ -1,7 +1,8 @@
 """
-cc_listen.py — cc 贾维斯语音输入（VAD + faster-whisper）
+cc_listen.py — cc 贾维斯语音输入（VAD + SenseVoice）
 
-基于能量的 VAD 自动切分语音段，配合 faster-whisper 做本地 STT。
+基于能量的 VAD 自动切分语音段，配合 SenseVoice 做本地 STT。
+SenseVoice 额外提供语音情感识别和音频事件检测。
 不需要手动按键，说话就识别，停顿就结束。
 
 用法：
@@ -9,60 +10,117 @@ cc_listen.py — cc 贾维斯语音输入（VAD + faster-whisper）
 
 架构：
     麦克风 → sounddevice 持续采样 → 能量 VAD 检测说话
-    → 录制语音段 → faster-whisper 转文字 → 返回文本
+    → 录制语音段 → SenseVoice 转文字 + 情感 + 事件 → 返回结果
 """
 
+import re
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import time
 import threading
 from pathlib import Path
-from typing import Optional, Callable
-from dataclasses import dataclass
+from typing import Optional, Callable, List
+from dataclasses import dataclass, field
 
 # ── 配置 ──
 SAMPLE_RATE = 16000          # whisper 最佳采样率
 CHANNELS = 1
 BLOCK_SIZE = 1024            # 每次采样帧数（~64ms @ 16kHz）
 ENERGY_THRESHOLD = 0.008     # 说话能量阈值（根据 EMEET 麦克风调整）
-SILENCE_DURATION = 1.5       # 静音多久判定说话结束（秒）
+SILENCE_DURATION = 0.8       # 静音多久判定说话结束（秒）— 流式管线需要更快响应
 MIN_SPEECH_DURATION = 0.5    # 最短有效语音段（秒），过短的丢弃
 MAX_SPEECH_DURATION = 30.0   # 最长语音段（秒），超过强制截断
 PRE_SPEECH_BUFFER = 0.3      # 说话前缓冲（秒），保留起始音
 AUDIO_PATH = "/tmp/cc-listen-segment.wav"
 
-# ── whisper 模型（懒加载）──
-_whisper_model = None
-_whisper_lock = threading.Lock()
+# ── SenseVoice 模型（懒加载）──
+_sensevoice_model = None
+_sensevoice_lock = threading.Lock()
+
+# SenseVoice 情感标签映射（英文 → 中文）
+EMOTION_MAP = {
+    "HAPPY": "开心",
+    "SAD": "难过",
+    "ANGRY": "生气",
+    "NEUTRAL": "平静",
+    "FEARFUL": "恐惧",
+    "DISGUSTED": "厌恶",
+    "SURPRISED": "惊讶",
+}
+
+# SenseVoice 音频事件标签
+AUDIO_EVENTS = {"Speech", "BGM", "Applause", "Laughter", "Crying", "Coughing", "Sneezing", "Breath"}
+
+# 解析 SenseVoice 原始输出的正则
+_TAG_PATTERN = re.compile(r"<\|([^|]+)\|>")
 
 
-def _get_whisper():
-    """懒加载 faster-whisper 模型（首次调用时加载，后续复用）"""
-    global _whisper_model
-    if _whisper_model is not None:
-        return _whisper_model
-    with _whisper_lock:
-        if _whisper_model is not None:
-            return _whisper_model
-        from faster_whisper import WhisperModel
-        print("[cc-listen] 加载 whisper medium 模型（中文精度更高）...")
-        _whisper_model = WhisperModel(
-            "medium",
+def _get_sensevoice():
+    """懒加载 SenseVoice 模型（首次调用时加载，后续复用）"""
+    global _sensevoice_model
+    if _sensevoice_model is not None:
+        return _sensevoice_model
+    with _sensevoice_lock:
+        if _sensevoice_model is not None:
+            return _sensevoice_model
+        from funasr import AutoModel
+        print("[cc-listen] 加载 SenseVoiceSmall 模型（ModelScope）...")
+        _sensevoice_model = AutoModel(
+            model="iic/SenseVoiceSmall",
+            vad_model="fsmn-vad",
+            vad_kwargs={"max_single_segment_time": 30000},
             device="cpu",
-            compute_type="int8",
+            trust_remote_code=True,
+            disable_update=True,
         )
-        print("[cc-listen] whisper medium 就绪")
-        return _whisper_model
+        print("[cc-listen] SenseVoiceSmall 就绪")
+        return _sensevoice_model
+
+
+def _parse_sensevoice_tags(raw_text: str) -> tuple:
+    """
+    解析 SenseVoice 原始输出中的标签。
+    输出格式: <|zh|><|HAPPY|><|Speech|><|withitn|>识别文本
+
+    Returns:
+        (clean_text, language, emotion, audio_events)
+    """
+    tags = _TAG_PATTERN.findall(raw_text)
+    # 去掉所有标签得到纯文本
+    clean = _TAG_PATTERN.sub("", raw_text).strip()
+
+    language = "zh"
+    emotion = "neutral"
+    audio_events: List[str] = []
+
+    for tag in tags:
+        # 语言标签
+        if tag in ("zh", "en", "yue", "ja", "ko"):
+            language = tag
+        # 情感标签（EMO_UNKNOWN 视为 neutral）
+        elif tag.upper() in EMOTION_MAP:
+            emotion = tag.lower()
+        elif tag == "EMO_UNKNOWN":
+            emotion = "neutral"
+        # 音频事件标签
+        elif tag in AUDIO_EVENTS:
+            audio_events.append(tag.lower())
+        # withitn / notitn 忽略
+
+    return clean, language, emotion, audio_events
 
 
 @dataclass
 class SpeechSegment:
-    """一段语音的识别结果"""
+    """一段语音的识别结果（含情感和音频事件）"""
     text: str
-    duration: float        # 语音时长（秒）
-    confidence: float      # 平均置信度
-    language: str          # 检测到的语言
+    duration: float             # 语音时长（秒）
+    confidence: float           # 平均置信度
+    language: str               # 检测到的语言
+    emotion: str = "neutral"    # 语音情感: happy/sad/angry/neutral/fearful/disgusted/surprised
+    emotion_cn: str = "平静"     # 情感中文
+    audio_events: List[str] = field(default_factory=list)  # 音频事件: laughter/applause/bgm...
 
 
 def _calculate_energy(audio_block: np.ndarray) -> float:
@@ -161,42 +219,59 @@ def listen_once(
 
 
 def _transcribe(audio_path: str, duration: float) -> Optional[SpeechSegment]:
-    """用 faster-whisper 识别语音文件"""
-    model = _get_whisper()
+    """用 SenseVoice 识别语音文件（含情感 + 音频事件）"""
+    model = _get_sensevoice()
     start = time.time()
 
-    segments, info = model.transcribe(
-        audio_path,
-        language="zh",
-        beam_size=5,
-        initial_prompt="贾维斯，川哥，你好，看看，环境，摄像头，帮我，打开，关闭，时间",
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=500,
-            speech_pad_ms=200,
-        ),
-    )
-
-    texts = []
-    confidences = []
-    for seg in segments:
-        texts.append(seg.text.strip())
-        confidences.append(seg.avg_logprob)
-
-    text = "".join(texts).strip()
-    elapsed = time.time() - start
-
-    if not text:
+    try:
+        res = model.generate(
+            input=audio_path,
+            language="auto",
+            use_itn=True,
+            batch_size_s=60,
+            merge_vad=True,
+            merge_length_s=15,
+        )
+    except Exception as e:
+        print(f"[cc-listen] SenseVoice 推理失败: {e}")
         return None
 
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
+    elapsed = time.time() - start
 
-    print(f"[cc-listen] 识别完成 ({elapsed:.1f}s): {text}")
+    if not res or not res[0].get("text"):
+        return None
+
+    raw_text = res[0]["text"]
+
+    # 先从原始输出解析情感和事件标签
+    clean_text, language, emotion, audio_events = _parse_sensevoice_tags(raw_text)
+
+    # 再用官方后处理清理文本（保险起见）
+    try:
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
+        clean_text = rich_transcription_postprocess(raw_text)
+    except ImportError:
+        pass  # 已经用正则清理过了
+
+    if not clean_text:
+        return None
+
+    emotion_cn = EMOTION_MAP.get(emotion.upper(), "平静")
+
+    print(f"[cc-listen] SenseVoice ({elapsed:.1f}s): {clean_text}")
+    if emotion != "neutral":
+        print(f"[cc-listen] 语音情感: {emotion_cn} ({emotion})")
+    if audio_events:
+        print(f"[cc-listen] 音频事件: {audio_events}")
+
     return SpeechSegment(
-        text=text,
+        text=clean_text,
         duration=duration,
-        confidence=avg_conf,
-        language=info.language,
+        confidence=0.0,
+        language=language,
+        emotion=emotion,
+        emotion_cn=emotion_cn,
+        audio_events=audio_events,
     )
 
 
@@ -254,7 +329,7 @@ def calibrate_mic(duration: float = 3.0) -> float:
 
 
 if __name__ == "__main__":
-    print("=== cc 贾维斯语音监听测试 ===")
+    print("=== cc 贾维斯语音监听测试（SenseVoice）===")
     print("先校准麦克风...")
     threshold = calibrate_mic()
     print(f"\n现在说话测试（30 秒超时）...")
@@ -262,5 +337,8 @@ if __name__ == "__main__":
     if result:
         print(f"\n识别结果: {result.text}")
         print(f"时长: {result.duration:.1f}s | 语言: {result.language}")
+        print(f"语音情感: {result.emotion_cn} ({result.emotion})")
+        if result.audio_events:
+            print(f"音频事件: {result.audio_events}")
     else:
         print("未检测到语音")

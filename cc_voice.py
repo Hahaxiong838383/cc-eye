@@ -70,6 +70,42 @@ def is_echo(text: str, threshold: float = 0.5) -> bool:
     return False
 
 
+def say_stream(text: str, voice: Optional[str] = None) -> None:
+    """cc 流式语音输出（edge-tts stream → subprocess 管道播放，不落盘）"""
+    asyncio.run(_speak_stream(text, voice or VOICE))
+
+
+async def _speak_stream(text: str, voice: str) -> None:
+    """流式合成 + 播放：边合成边播放，减少首字延迟"""
+    import edge_tts
+    import subprocess
+
+    # 记录播放文本（回声过滤）
+    with _tts_lock:
+        _recent_tts_texts.append(text)
+        if len(_recent_tts_texts) > 5:
+            _recent_tts_texts.pop(0)
+
+    communicate = edge_tts.Communicate(text, voice, rate=RATE, pitch=PITCH)
+
+    # 用 ffplay 直接从 stdin 播放 mp3 流（不落盘）
+    # -nodisp 不显示窗口，-autoexit 播完退出，-loglevel quiet 不输出日志
+    proc = subprocess.Popen(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        stdin=subprocess.PIPE,
+    )
+
+    try:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                if proc.stdin:
+                    proc.stdin.write(chunk["data"])
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait()
+
+
 def greet() -> None:
     """cc 贾维斯打招呼"""
     try:

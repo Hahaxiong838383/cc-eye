@@ -65,6 +65,7 @@ class StateSnapshot:
     confidence: float                       # 0.0 ~ 1.0
     identity: str = "unknown"
     dominant_emotion: str = "neutral"
+    voice_emotion: str = ""                 # SenseVoice 语音情感（如有）
     blink_rate: float = 0.0                 # 每分钟眨眼次数
     avg_ear: float = 0.0
     yaw: float = 0.0
@@ -74,6 +75,38 @@ class StateSnapshot:
 
 # 状态变化回调类型
 StateChangeCallback = Callable[[UserState, UserState, StateSnapshot], None]
+
+# ── 语音情感注入（模块级，跨模块共享）──
+VOICE_EMOTION_TTL: float = 15.0  # 语音情感有效期（秒）
+_shared_voice_emotion: str = ""
+_shared_voice_emotion_ts: float = 0.0
+
+# 语音情感 → 视觉表情的映射（用于融合投票）
+_VOICE_TO_VISUAL_MAP: Dict[str, str] = {
+    "happy": "happy",
+    "sad": "sad",
+    "angry": "angry",
+    "fearful": "fear",
+    "disgusted": "disgust",
+    "surprised": "surprise",
+    "neutral": "neutral",
+}
+
+
+def inject_voice_emotion(emotion: str) -> None:
+    """外部模块注入语音情感（SenseVoice 识别结果）"""
+    global _shared_voice_emotion, _shared_voice_emotion_ts
+    _shared_voice_emotion = emotion
+    _shared_voice_emotion_ts = time.time()
+    if emotion and emotion != "neutral":
+        logger.info("语音情感注入: %s", emotion)
+
+
+def get_current_voice_emotion() -> str:
+    """获取当前有效的语音情感（过期返回空串）"""
+    if time.time() - _shared_voice_emotion_ts > VOICE_EMOTION_TTL:
+        return ""
+    return _shared_voice_emotion
 
 
 class StateFusion:
@@ -159,6 +192,9 @@ class StateFusion:
         face_frames = [s for s in self._window if s.face_detected]
         face_ratio = len(face_frames) / len(self._window) if self._window else 0.0
 
+        # 获取当前语音情感（所有分支共用）
+        voice_emo = get_current_voice_emotion()
+
         # 1) 离开判定：大部分帧没检测到人脸
         if face_ratio < AWAY_CONFIDENCE_THRESHOLD or not latest.face_detected:
             return StateSnapshot(
@@ -166,6 +202,7 @@ class StateFusion:
                 confidence=1.0 - face_ratio,
                 identity=latest.identity,
                 dominant_emotion=latest.dominant_emotion,
+                voice_emotion=voice_emo if voice_emo else "",
                 timestamp=latest.timestamp,
             )
 
@@ -179,10 +216,18 @@ class StateFusion:
         # 平均 EAR
         avg_ear = sum(s.ear for s in face_frames) / len(face_frames) if face_frames else 0.3
 
-        # 表情统计
+        # 表情统计（视觉 + 语音融合）
         emotion_counts: Dict[str, int] = {}
         for s in face_frames:
             emotion_counts[s.dominant_emotion] = emotion_counts.get(s.dominant_emotion, 0) + 1
+
+        # 语音情感注入：权重 = 窗口内视觉帧数 × 0.6（语音单次但权重高）
+        if voice_emo:
+            visual_equiv = _VOICE_TO_VISUAL_MAP.get(voice_emo, "")
+            if visual_equiv:
+                voice_weight = max(1, int(len(face_frames) * 0.6))
+                emotion_counts[visual_equiv] = emotion_counts.get(visual_equiv, 0) + voice_weight
+
         dominant_in_window = max(emotion_counts, key=lambda k: emotion_counts[k]) if emotion_counts else "neutral"
 
         # 2) 疲劳判定：眨眼率高 或 平均 EAR 低

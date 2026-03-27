@@ -24,10 +24,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from cc_voice import say, set_aec, is_echo
+from cc_voice import say, say_stream, set_aec, is_echo
 from cc_listen import listen_once, SpeechSegment, calibrate_mic
 from cc_aec import EchoCanceller
-from cc_brain import think
+from cc_brain import think, think_stream
+from state_fusion import inject_voice_emotion
 from cc_events import (
     post_event,
     sync_from_daemon_events,
@@ -148,17 +149,33 @@ class CcInteract:
 
         print(f"\n[cc-interact] 川哥说: {text}")
 
+        # 注入语音情感到融合引擎 + 发布事件流
+        if segment.emotion:
+            inject_voice_emotion(segment.emotion)
+        if segment.emotion and segment.emotion != "neutral":
+            post_event(
+                "speech",
+                f"语音情感: {segment.emotion_cn} ({segment.emotion})",
+                source="interact",
+            )
+        if segment.audio_events:
+            for evt in segment.audio_events:
+                if evt != "speech":
+                    post_event("speech", f"音频事件: {evt}", source="interact")
+
         # 获取当前视觉上下文
         scene = get_scene_context()
         scene_desc = ""
         if scene:
             scene_desc = f"（当前场景：{scene.get('description', '')[:100]}）"
 
-        # Gemini 3 Flash 生成回复（降级到本地 ollama）
-        response = think(text)
-
-        if response:
-            self._enqueue_speak(response)
+        # 流式管线：LLM 按句 yield → 每句立即 TTS 播放
+        for sentence in think_stream(text):
+            print(f"[cc-interact] 🗣️ {sentence}")
+            try:
+                say_stream(sentence)
+            except Exception:
+                say(sentence)  # ffplay 不可用时降级到 afplay
 
     def _generate_response(self, user_text: str, scene_context: str) -> str:
         """
