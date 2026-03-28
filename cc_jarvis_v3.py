@@ -56,9 +56,11 @@ RESUME_WORDS = ["说吧", "你说", "继续说", "可以说了", "说话"]
 
 # 智能过渡语气词库（长句等云端时用，按长度分级，随机不重复）
 TRANSITION_PHRASES = {
-    "short": ["嗯。", "好。", "行。", "嗯嗯。"],
-    "medium": ["让我想想。", "这个嘛。", "好问题。", "有点意思。", "稍等。"],
-    "long": ["这个方向挺好的。", "我梳理一下思路。", "让我整理下信息。", "这个值得聊聊。"],
+    "short": ["嗯，你说。", "好的呢。", "收到了。", "我看看。"],
+    "medium": ["让我想想。", "这个嘛。", "好问题。", "有点意思。", "稍等一下。",
+               "我查一下。", "我看看最新的。", "让我确认一下。"],
+    "long": ["这个方向挺好的。", "我梳理一下思路。", "让我整理下信息。", "这个值得聊聊。",
+             "这个值得展开说说。", "让我看看方案。"],
 }
 _last_transitions: list = []  # 避免重复
 
@@ -389,8 +391,8 @@ class JarvisV3:
             self.state = "IDLE"
             return
 
-        # 回声过滤（只检查刚播完的，不检查历史）
-        if (time.time() - self._last_play_time) < 5.0 and self._is_echo(clean_text):
+        # 回声过滤（只检查刚播完 2 秒内）
+        if (time.time() - self._last_play_time) < 2.0 and self._is_echo(clean_text):
             self.state = "IDLE"
             return
 
@@ -428,8 +430,8 @@ class JarvisV3:
 
     # 唤醒应答词库（从预缓存中随机选）
     _WAKE_RESPONSES = [
-        "在。", "我在。", "说吧。", "在的。", "随时待命。",
-        "怎么了。", "好，我在。", "需要我做什么？",
+        "我在的。", "你说吧。", "在的呢。", "随时待命。",
+        "怎么了？", "好，我在。", "需要我做什么？", "还有别的事吗？",
     ]
     _last_wake_response = ""
 
@@ -499,21 +501,18 @@ class JarvisV3:
             return True
 
         time_since = time.time() - self._last_play_time
-        if time_since < 3:
-            threshold = 0.35
-        elif time_since < 8:
-            threshold = 0.5
-        elif time_since < 15:
-            threshold = 0.7
-        else:
-            return False
+        if time_since > 2.0:
+            return False  # 超过 2 秒不可能是回声
+        threshold = 0.7  # 只有高度相似才算回声
 
         for tts in self._recent_tts[-8:]:
             tts_clean = tts.strip("。？！，、；：.!? ")
             if not tts_clean or len(tts_clean) < 3:
-                continue  # TTS 太短（如"在"），不做回声匹配
+                continue
             if len(clean) > len(tts_clean) * 3:
-                continue  # 用户说的远比 TTS 长，不可能是回声
+                continue  # 用户说的远比 TTS 长
+            if len(clean) < len(tts_clean) * 0.3:
+                continue  # 用户说的远比 TTS 短，是正常回复不是回声
             sim = self._similarity(clean, tts_clean)
             if sim >= threshold:
                 logger.info(f"[echo] sim={sim:.2f}: '{clean[:20]}' ≈ '{tts_clean[:20]}'")

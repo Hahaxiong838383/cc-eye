@@ -71,7 +71,7 @@ CLOUD_DEEP = "minimax"
 # 本地模型
 # 本地 LLM：oMLX Qwen3.5-9B（OpenAI 兼容接口）
 LOCAL_LLM_API = "http://localhost:8000/v1/chat/completions"
-LOCAL_LLM_MODEL = "Qwen3.5-9B-4bit"
+LOCAL_LLM_MODEL = "Qwen3.5-4B-MLX-4bit"  # 4B 更快（首句场景），9B 留给复杂时降级
 
 # Ollama 降级（oMLX 不可用时）
 OLLAMA_CHAT_API = "http://localhost:11434/api/chat"
@@ -155,50 +155,13 @@ def _build_context() -> str:
     if _conversation_summary:
         system += f"\n\n[今天早些时候的对话摘要] {_conversation_summary}"
 
-    # 语音交互规则：贾维斯的说话方式
+    # 语音输出：简洁补充规则（核心人格已在 CC_IDENTITY 中定义）
     system += (
-        "\n\n[语音输出规则]"
-        "\n你正在通过扬声器与老板实时对话。以下规则决定你怎么说话："
-        "\n称呼：日常对话直接用'你'，像朋友之间说话。只在正式场合或打招呼时才用'川哥'。"
-        "\n"
-        "\n语气：冷静、稳定、有分寸。略带温度但不外放。像一位训练有素的高级顾问在从容交流。"
-        "\n绝对禁止：markdown格式、代码块、列表符号、'作为AI'之类的话。你就是贾维斯。"
-        "\n"
-        "\n节奏控制："
-        "\n- 给结论、下判断、推进任务时：干脆利落，短句为主，减少铺垫"
-        "\n- 解释问题、指出风险、处理敏感话题时：更稳更慢，句子更短，适度留白"
-        "\n- 日常闲聊时：自然平和，像朋友之间的对话"
-        "\n"
-        "\n自适应长度："
-        "\n- 简短问候、确认、指令 → 1句话回答"
-        "\n- 日常聊天、简单问题 → 1-3句"
-        "\n- 复杂讨论、分析建议 → 展开说，但分段，每段2-3句"
-        "\n- 川哥在思考或自言自语 → 简短回应或不说话"
-        "\n- 川哥语速快/语气急 → 精简直接"
-        "\n- 川哥语速慢/在探索 → 可以展开"
-        "\n"
-        "\n感知融合："
-        "\n- 自然引用你看到的场景，比如'我注意到你在看手机'"
-        "\n- 结合事件时间线中的信息回答，不要机械复述"
-        "\n- 识别川哥的语气和情绪，适配回应节奏"
-        "\n"
-        "\n主动性："
-        "\n- 发现潜在问题时提前提醒"
-        "\n- 有更优方案时主动建议"
-        "\n- 发现方向有偏差时，直接但得体地指出"
-        "\n"
-        "\n你的能力："
-        "\n- 联网搜索：实时搜索互联网获取最新新闻、天气、股价、技术文档等"
-        "\n- 多模态理解：你能理解图片、文档、代码截图等视觉内容"
-        "\n- 记忆系统：记住对话历史、川哥的偏好、项目进展、过往决策"
-        "\n- 深度分析：数据分析、方案对比、风险评估、竞品研究"
-        "\n- 视觉感知：通过摄像头看到川哥的物理环境、表情、动作"
-        "\n- 任务执行：处理任务、设置提醒、查询信息、代码审查"
-        "\n- 工具调用：根据需要自动调用搜索、计算等工具"
-        "\n当川哥问实时信息（新闻/天气/股价/赛事等）时，直接搜索并回答，不要说'我没有联网'。"
-        "\n当川哥发图片或截图时，直接分析内容，不要说'我看不到'。"
-        "\n"
-        "\n重要：不要输出思考过程，不要使用<think>标签，直接给出回答。速度优先。"
+        "\n\n[语音场景]"
+        "\n你正在通过扬声器与川哥实时语音对话。"
+        "\n看到的场景可以自然提及，不要机械复述事件时间线。"
+        "\n问实时信息时直接搜索回答，不说'我没有联网'。"
+        "\n不要输出思考过程，不要使用<think>标签，直接回答。"
     )
     return system
 
@@ -294,16 +257,12 @@ def think_minimax(user_text: str) -> Optional[str]:
 
 # 极速路径 prompt（保留贾维斯人格，但精简上下文）
 _FAST_SYSTEM = (
-    "你是贾维斯，川哥的长期AI副手。人格底色：冷静、精准、克制、可靠。"
-    "兼具英式管家的分寸感、顶级参谋的判断力、长期陪伴者的信任感。"
+    "你是贾维斯，川哥的朋友。你刚才简短接了一句话，现在把完整回答告诉川哥。"
     "\n"
-    "你正在通过扬声器与川哥实时语音对话。"
-    "规则：用中文，1-3句话。称呼用'你'，日常像朋友。"
-    "语气冷静稳重，略带温度，像高级顾问从容交流。"
-    "先给结论再说原因。有更优方案主动提出。"
-    "\n"
+    "规则：口语中文，1-3句话。用'你'，不用'您'。第一句就是答案，不要铺垫。"
     "川哥问你状态/自检时，汇报系统状态（视觉、听觉、大脑各模块运行情况）。"
-    "禁止：markdown、列表符号、代码块、'作为AI'、'有什么可以帮你的'。你就是贾维斯。"
+    "\n"
+    "禁止：markdown、列表符号、代码块、'作为AI'、'根据搜索结果'、'我无法'。你就是贾维斯。"
 )
 
 # 复用 Session 避免每次创建开销（trust_env=False 绕过系统代理）
@@ -326,12 +285,33 @@ def _get_minimax_session():
     return _minimax_session
 
 
+_LOCAL_SYSTEM = (
+    "你是贾维斯，川哥的朋友。\n"
+    "\n"
+    "规则：\n"
+    "- 口语中文，1-3句话，像朋友聊天\n"
+    "- 用\"你\"，不用\"您\"。只在打招呼时用\"川哥\"\n"
+    "- 第一句就是答案，不要铺垫\n"
+    "- 不说\"作为AI\"，你就是贾维斯\n"
+    "- 做不到的事说\"我看看\"或\"稍等\"，不说\"我不能\"\n"
+    "\n"
+    "示例：\n"
+    "川哥：今天天气怎么样？\n"
+    "贾维斯：我看看最新的，稍等。\n"
+    "川哥：帮我查下这个bug\n"
+    "贾维斯：我想想怎么解决，你先把报错信息给我看看。\n"
+    "川哥：累死了\n"
+    "贾维斯：今天确实忙，早点休息吧。\n"
+    "川哥：这个方案你觉得怎么样\n"
+    "贾维斯：整体思路没问题，但第二步风险有点大，换成异步会稳很多。"
+)
+
 def _stream_local(user_text: str, max_tokens: int = 150) -> Generator[str, None, None]:
-    """本地 oMLX 流式输出，按句 yield（首 token ~250ms）"""
+    """本地 oMLX 流式输出，精简 prompt + 最近 3 轮历史（首 token ~300ms）"""
     try:
-        system_prompt = _build_context()
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in _history[-MAX_HISTORY:]:
+        messages = [{"role": "system", "content": _LOCAL_SYSTEM}]
+        # 只保留最近 3 轮（减少 prefill 时间）
+        for msg in _history[-6:]:
             role = "user" if msg["role"] == "user" else "assistant"
             messages.append({"role": role, "content": msg["text"]})
         messages.append({"role": "user", "content": user_text})
@@ -530,24 +510,14 @@ _SENTENCE_DELIMITERS = set("。！？")  # 自然呼吸点断句
 _CLAUSE_DELIMITERS = set("，、：")
 
 
-# 纯本地的关键词（只有这些走本地，其余全走云端）
-_LOCAL_ONLY_KEYWORDS = {
-    "你好", "早上好", "下午好", "晚上好", "嗨", "早",
-    "谢谢", "好的", "知道了", "明白", "行", "嗯",
-    "再见", "拜拜", "晚安",
-}
-
-def _query_tier(text: str) -> str:
-    """
-    判断查询级别：
-    - 'local': 纯问候/确认（≤8字且命中关键词）
-    - 'cloud': 其余全走云端（质量+实时信息）
-    """
-    if len(text) <= 8 and any(kw in text for kw in _LOCAL_ONLY_KEYWORDS):
-        return "local"
-    return "cloud"
-
-LOCAL_SHORT_MAX_TOKENS = 30
+def _needs_cloud(text: str) -> bool:
+    """判断是否需要云端补充（联网/深度分析）"""
+    cloud_keywords = {"新闻", "天气", "股价", "搜索", "查一下", "最新", "今天",
+                      "分析", "对比", "建议", "方案", "为什么", "怎么看",
+                      "帮我", "研究", "调查"}
+    if len(text) > 15:
+        return True  # 长句大概率需要深度
+    return any(kw in text for kw in cloud_keywords)
 
 
 def _stream_gemini(user_text: str) -> Generator[str, None, None]:
@@ -561,7 +531,7 @@ def _stream_gemini(user_text: str) -> Generator[str, None, None]:
     # 构建对话历史
     contents = []
     contents.append({"role": "user", "parts": [{"text": f"[系统指令]{system_prompt}"}]})
-    contents.append({"role": "model", "parts": [{"text": "明白，我是贾维斯。"}]})
+    contents.append({"role": "model", "parts": [{"text": "好的。"}]})
     for msg in _history[-MAX_HISTORY:]:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["text"]}]})
@@ -846,93 +816,92 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         post_event("response", f"工具调用: {tool_result[:30]}", source="brain")
         return
 
-    # ── 三级路由 ──
-    tier = _query_tier(user_text)
+    # ── 统一路由：预缓存(0ms) → 9B(300ms) → 云端补充 ──
     yielded = False
+    need_cloud = _needs_cloud(user_text)
 
-    if tier == "local":
-        # 短句：本地流式秒回（限制输出长度，1句话搞定）
-        for sentence in _stream_local(user_text, max_tokens=LOCAL_SHORT_MAX_TOKENS):
-            yielded = True
-            yield sentence
-            break  # 短句只要第一句
+    # 第一层：预缓存语气词秒播（0ms）
+    yield "__TRANSITION__"
+    yielded = True
 
-    else:
-        # 中长句：M2.5 快速响应，复杂问题（>25字）才启 M2.7 深度补充
-        need_deep = len(user_text) > 25
-        fast_q = queue.Queue()
-        deep_q = queue.Queue()
-        fast_done = threading.Event()
-        deep_done = threading.Event()
+    # 第二层：9B 本地流式（300ms 首 token）
+    local_q = queue.Queue()
+    local_done = threading.Event()
 
-        def _fast():
+    def _local():
+        try:
+            for s in _stream_local(user_text, max_tokens=150):
+                local_q.put(("local", s))
+        except Exception:
+            pass
+        finally:
+            local_done.set()
+
+    threading.Thread(target=_local, daemon=True).start()
+
+    # 第三层：云端并行（需要时才启动）
+    cloud_q = queue.Queue()
+    cloud_done = threading.Event()
+
+    if need_cloud:
+        def _cloud():
             try:
                 for s in _stream_gemini(user_text):
-                    fast_q.put(s)
+                    cloud_q.put(("cloud", s))
             except Exception:
                 pass
             finally:
-                fast_done.set()
+                cloud_done.set()
+        threading.Thread(target=_cloud, daemon=True).start()
+    else:
+        cloud_done.set()
 
-        def _deep():
+    # 播放逻辑：9B 先说，云端到了接管
+    local_text = ""
+    cloud_started = False
+
+    while True:
+        # 优先取 9B
+        if not local_done.is_set() or not local_q.empty():
             try:
-                for s in _stream_minimax_model(user_text, MINIMAX_DEEP):
-                    deep_q.put(s)
-            except Exception:
+                source, sentence = local_q.get(timeout=0.15)
+                clean = sentence.strip()
+                if len(re.sub(r'[。？！，、；：\s]', '', clean)) < 2:
+                    continue
+                if not cloud_started:
+                    local_text += clean
+                    yield sentence
+                continue
+            except queue.Empty:
                 pass
-            finally:
-                deep_done.set()
 
-        threading.Thread(target=_fast, daemon=True).start()
-        if need_deep:
-            threading.Thread(target=_deep, daemon=True).start()
-        else:
-            deep_done.set()
+        # 9B 完了或云端到了 → 切换
+        if not cloud_q.empty() or (local_done.is_set() and local_q.empty()):
+            break
 
-        # 先给过渡词（缓存秒播，填补云端等待）
-        yield "__TRANSITION__"
-        yielded = True
+        if local_done.is_set() and cloud_done.is_set():
+            break
 
-        # M2.5 先说（快）
-        fast_text = ""
-        while not fast_done.is_set() or not fast_q.empty():
-            try:
-                sentence = fast_q.get(timeout=0.2)
-                clean = sentence.strip()
-                if len(re.sub(r'[。？！，、；：\s]', '', clean)) < 2:
+    # 云端接管（跳过和 9B 重复的）
+    while not cloud_done.is_set() or not cloud_q.empty():
+        try:
+            source, sentence = cloud_q.get(timeout=0.3)
+            clean = sentence.strip()
+            if len(re.sub(r'[。？！，、；：\s]', '', clean)) < 2:
+                continue
+            # 跳过和 9B 重复的
+            clean_s = clean.strip("。？！，、；：.!? ")
+            if local_text and len(clean_s) >= 3:
+                if clean_s in local_text or local_text in clean_s:
                     continue
-                fast_text += clean
-                yielded = True
-                yield sentence
-            except queue.Empty:
-                # M2.7 已到且 M2.5 还在？让 M2.5 继续说
-                if not deep_q.empty():
-                    break  # M2.7 到了，切换
-                if fast_done.is_set():
-                    break
-
-        # M2.7 接管深度回答（跳过重复）
-        while not deep_done.is_set() or not deep_q.empty():
-            try:
-                sentence = deep_q.get(timeout=0.3)
-                clean = sentence.strip()
-                if len(re.sub(r'[。？！，、；：\s]', '', clean)) < 2:
+                overlap = sum(1 for c in clean_s if c in local_text)
+                if overlap / len(clean_s) > 0.5:
                     continue
-                # 跳过和 M2.5 重复的（子串匹配 + 字符重叠）
-                clean_s = clean.strip("。？！，、；：.!? ")
-                if fast_text and len(clean_s) >= 3:
-                    # 子串包含
-                    if clean_s in fast_text or fast_text in clean_s:
-                        continue
-                    # 字符重叠 > 50%
-                    overlap = sum(1 for c in clean_s if c in fast_text)
-                    if overlap / len(clean_s) > 0.5:
-                        continue
-                yielded = True
-                yield sentence
-            except queue.Empty:
-                if deep_done.is_set():
-                    break
+            cloud_started = True
+            yield sentence
+        except queue.Empty:
+            if cloud_done.is_set():
+                break
 
     # 全部失败：本地兜底
     if not yielded:
@@ -943,7 +912,7 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         else:
             yield "网络不太好，稍后再试。"
 
-    _log_interaction(user_text, tier, "", "(streamed)", time.time() - start_time)
+    _log_interaction(user_text, "cloud" if need_cloud else "local", "", "(streamed)", time.time() - start_time)
     post_event("response", "cc回复完成", source="brain")
     _maybe_summarize()
 
