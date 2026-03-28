@@ -55,18 +55,16 @@ def _log_interaction(user_text: str, route: str, local_reply: str, cloud_reply: 
 _ENV_FILE = Path(__file__).parent / ".env"
 _minimax_api_key: Optional[str] = None
 _gemini_api_key: Optional[str] = None
+_doubao_api_key: Optional[str] = None
 
-# MiniMax（深度思考）
+# 豆包（云端快速路径，首 token ~300ms）
+DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
+DOUBAO_MODEL = "doubao-seed-2.0-lite"
+
+# MiniMax（云端深度路径）
 MINIMAX_API_URL = "https://api.minimaxi.com/v1/chat/completions"
 MINIMAX_DEEP = "MiniMax-M2.7-highspeed"
 MINIMAX_MODEL = MINIMAX_DEEP
-
-# Gemini（快速响应，718ms 首 token）
-GEMINI_MODEL = "models/gemini-2.5-flash-lite"
-
-# 云端快速 = Gemini，云端深度 = MiniMax M2.7
-CLOUD_FAST = "gemini"
-CLOUD_DEEP = "minimax"
 
 # 本地模型
 # 本地 LLM：oMLX Qwen3.5-9B（OpenAI 兼容接口）
@@ -129,6 +127,33 @@ def _load_minimax_key() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _load_doubao_key() -> Optional[str]:
+    """从 .env 文件加载豆包 API Key"""
+    global _doubao_api_key
+    if _doubao_api_key:
+        return _doubao_api_key
+    try:
+        if _ENV_FILE.exists():
+            for line in _ENV_FILE.read_text().splitlines():
+                if line.startswith("DOUBAO_API_KEY="):
+                    _doubao_api_key = line.split("=", 1)[1].strip()
+                    return _doubao_api_key
+    except Exception:
+        pass
+    return None
+
+
+_doubao_session = None
+
+def _get_doubao_session():
+    """豆包是国内服务，直连不走代理"""
+    global _doubao_session
+    if _doubao_session is None:
+        _doubao_session = requests.Session()
+        _doubao_session.trust_env = False
+    return _doubao_session
 
 
 def _build_context() -> str:
@@ -311,7 +336,7 @@ def _stream_local(user_text: str, max_tokens: int = 150) -> Generator[str, None,
     try:
         messages = [{"role": "system", "content": _LOCAL_SYSTEM}]
         # 只保留最近 3 轮（减少 prefill 时间）
-        for msg in _history[-6:]:
+        for msg in _history[-4:]:
             role = "user" if msg["role"] == "user" else "assistant"
             messages.append({"role": role, "content": msg["text"]})
         messages.append({"role": "user", "content": user_text})
@@ -508,6 +533,81 @@ _SIMPLE_KEYWORDS = {
 # 句子分割标点（用于流式按句 yield）
 _SENTENCE_DELIMITERS = set("。！？")  # 自然呼吸点断句
 _CLAUSE_DELIMITERS = set("，、：")
+
+
+def _stream_doubao(user_text: str) -> Generator[str, None, None]:
+    """豆包 doubao-seed-2.0-lite 流式（~300ms 首 token）"""
+    api_key = _load_doubao_key()
+    if not api_key:
+        return
+
+    system_prompt = _build_context()
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in _history[-MAX_HISTORY:]:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["text"]})
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        start = time.time()
+        resp = _get_doubao_session().post(
+            DOUBAO_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DOUBAO_MODEL,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 4096,
+                "stream": True,
+            },
+            timeout=20,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            print(f"[cc-brain] 豆包 API 错误: {resp.status_code} {resp.text[:200]}")
+            return
+
+        full_text = ""
+        sentence_buf = ""
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                token = json.loads(data_str)["choices"][0]["delta"].get("content", "")
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
+            if not token:
+                continue
+
+            full_text += token
+            for ch in token:
+                sentence_buf += ch
+                if ch in _SENTENCE_DELIMITERS:
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+
+        if sentence_buf.strip():
+            yield sentence_buf.strip()
+
+        elapsed = time.time() - start
+        _history.append({"role": "user", "text": user_text})
+        _history.append({"role": "model", "text": full_text})
+        print(f"[cc-brain] 豆包 ({elapsed:.1f}s): {full_text[:60]}")
+
+    except Exception as e:
+        print(f"[cc-brain] 豆包错误: {e}")
 
 
 def _needs_cloud(text: str) -> bool:
@@ -846,7 +946,7 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     if need_cloud:
         def _cloud():
             try:
-                for s in _stream_gemini(user_text):
+                for s in _stream_doubao(user_text):
                     cloud_q.put(("cloud", s))
             except Exception:
                 pass

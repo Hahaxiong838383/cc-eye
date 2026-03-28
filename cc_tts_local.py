@@ -1,26 +1,26 @@
 """
-cc_tts_local.py — 本地 TTS（Qwen3-TTS 1.7B VoiceDesign MLX）
+cc_tts_local.py — 本地 TTS（Qwen3-TTS Base + 锁定音色）
 
-主模型：VoiceDesign（定制贾维斯声音）
-降级：CustomVoice aiden
+音色锁定：Base 模型 + ref_audio（从 VoiceDesign 生成的参考音频）
+每次合成使用同一段参考音频，speaker embedding 固定，音色不漂移。
 
 用法：
-    from cc_tts_local import local_tts_to_pcm
+    from cc_tts_local import local_tts_to_pcm, preload
     pcm, sr = local_tts_to_pcm("你好")
 """
 
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
-from cc_voice_profile import JARVIS_VOICE_INSTRUCT, VOICE_DESIGN_MODEL, CUSTOM_VOICE_MODEL, FALLBACK_SPEAKER
+
+from cc_voice_profile import BASE_MODEL, REF_AUDIO_PATH, REF_TEXT
 
 _tts_model = None
-_tts_mode = "voice_design"  # "voice_design" 或 "custom_voice"
 
 
 def _get_model():
-    """懒加载 TTS 模型（优先 VoiceDesign）"""
-    global _tts_model, _tts_mode
+    """懒加载 Base TTS 模型"""
+    global _tts_model
     if _tts_model is not None:
         return _tts_model
 
@@ -28,43 +28,45 @@ def _get_model():
     warnings.filterwarnings("ignore")
     from mlx_audio.tts.utils import load_model
 
-    try:
-        _tts_model = load_model(VOICE_DESIGN_MODEL)
-        _tts_mode = "voice_design"
-        print("[cc-tts] Qwen3-TTS 1.7B VoiceDesign 就绪（贾维斯定制声音）")
-    except Exception as e:
-        print(f"[cc-tts] VoiceDesign 加载失败: {e}，降级到 CustomVoice")
-        _tts_model = load_model(CUSTOM_VOICE_MODEL)
-        _tts_mode = "custom_voice"
-        print(f"[cc-tts] CustomVoice 就绪 (speaker={FALLBACK_SPEAKER})")
+    _tts_model = load_model(BASE_MODEL)
+    print("[cc-tts] Qwen3-TTS 1.7B Base 就绪（ref_audio 音色锁定）")
     return _tts_model
 
 
-def set_speaker(name: str) -> str:
-    """切换音色（仅 custom_voice 模式）"""
-    pass  # VoiceDesign 模式下不需要切换
-    print(f"[cc-tts] 音色切换: {_current_speaker}")
-    return _current_speaker
+def _validate_ref_audio() -> bool:
+    """检查参考音频是否存在"""
+    if not REF_AUDIO_PATH.exists():
+        print(f"[cc-tts] 警告：参考音频不存在 {REF_AUDIO_PATH}")
+        print("[cc-tts] 请运行 python scripts/gen_jarvis_ref.py 生成")
+        return False
+    return True
 
 
 def local_tts_to_pcm(
     text: str,
     speaker: Optional[str] = None,
 ) -> Tuple[np.ndarray, int]:
-    """本地合成语音，优先查缓存（命中 <1ms）"""
+    """
+    本地合成语音（Base 模型 + ref_audio 音色锁定）。
+    优先查缓存（命中 <1ms）。
+    """
     if text in _audio_cache:
         return _audio_cache[text]
 
     model = _get_model()
 
-    if _tts_mode == "voice_design":
-        results = list(model.generate_voice_design(
-            text=text,
-            language="Chinese",
-            instruct=JARVIS_VOICE_INSTRUCT,
-        ))
+    if not _validate_ref_audio():
+        # 无参考音频时降级：直接用 base 模型无音色合成
+        results = list(model.generate(text=text, lang_code="auto"))
     else:
-        results = list(model.generate_custom_voice(text=text, speaker=FALLBACK_SPEAKER))
+        # 正常路径：ref_audio 锁定音色
+        results = list(model.generate(
+            text=text,
+            ref_audio=str(REF_AUDIO_PATH),
+            ref_text=REF_TEXT,
+            lang_code="auto",
+        ))
+
     r = results[0]
     samples = np.array(r.audio, dtype=np.float32)
 
@@ -86,11 +88,22 @@ def local_tts_to_pcm(
 
 def local_tts_stream(text: str, speaker: Optional[str] = None):
     """
-    流式合成，yield (pcm_chunk, sample_rate)。首包 ~230ms。
+    流式合成，yield (pcm_chunk, sample_rate)。
+    Base 模型 + ref_audio，支持 stream=True。
     """
     model = _get_model()
-    spk = speaker or _current_speaker
-    for result in model.generate_custom_voice(text=text, speaker=spk, stream=True, streaming_interval=0.3):
+
+    if not _validate_ref_audio():
+        return
+
+    for result in model.generate(
+        text=text,
+        ref_audio=str(REF_AUDIO_PATH),
+        ref_text=REF_TEXT,
+        lang_code="auto",
+        stream=True,
+        streaming_interval=0.3,
+    ):
         samples = np.array(result.audio, dtype=np.float32)
         if len(samples) == 0:
             continue
@@ -137,7 +150,7 @@ _PRECACHE_PHRASES = [
 
 # 缓存文件路径
 _CACHE_DIR = Path(__file__).parent / ".venv" / "cache"
-_CACHE_FILE = _CACHE_DIR / "tts_cache.npz"
+_CACHE_FILE = _CACHE_DIR / "tts_cache_base.npz"  # 新文件名，和旧 VoiceDesign 缓存区分
 
 
 def _load_cache_from_disk():
@@ -177,8 +190,12 @@ def _save_cache_to_disk():
 
 
 def preload():
-    """预加载模型 + 加载/生成缓存"""
+    """预加载模型 + 加载/生成缓存（使用 Base + ref_audio 音色锁定）"""
     model = _get_model()
+
+    if not _validate_ref_audio():
+        print("[cc-tts] 无参考音频，跳过预缓存")
+        return
 
     # 先从磁盘加载
     loaded = _load_cache_from_disk()
@@ -192,12 +209,12 @@ def preload():
     print(f"[cc-tts] 合成缺失短句: {len(missing)} 条...")
     for phrase in missing:
         try:
-            if _tts_mode == "voice_design":
-                results = list(model.generate_voice_design(
-                    text=phrase, language="Chinese", instruct=JARVIS_VOICE_INSTRUCT,
-                ))
-            else:
-                results = list(model.generate_custom_voice(text=phrase, speaker=FALLBACK_SPEAKER))
+            results = list(model.generate(
+                text=phrase,
+                ref_audio=str(REF_AUDIO_PATH),
+                ref_text=REF_TEXT,
+                lang_code="auto",
+            ))
             samples = np.array(results[0].audio, dtype=np.float32)
             peak = np.abs(samples).max()
             if peak > 0.001:

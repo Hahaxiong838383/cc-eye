@@ -548,6 +548,7 @@ class JarvisV3:
     def _respond(self, text: str):
         self._responding = True
         self.state = "SPEAKING"
+        self.vision.pause()  # 对话时暂停视觉扫描，释放 MLX 锁
 
         synth_queue = queue.Queue()
 
@@ -621,6 +622,7 @@ class JarvisV3:
             self._last_play_time = time.time()
 
         self._responding = False
+        self.vision.resume()  # 对话结束，恢复视觉扫描
         self._reset_vad()
         time.sleep(0.15)
         self.state = "IDLE"

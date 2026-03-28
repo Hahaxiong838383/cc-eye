@@ -1,10 +1,31 @@
 """
-cc_voice_profile.py — 贾维斯声音档案（VoiceDesign 描述 + 配置）
+cc_voice_profile.py — 贾维斯声音档案
 
-锁定版本：2026-03-28 v4
+锁定版本：2026-03-29 v5
+
+音色锁定方案：
+    1. VoiceDesign 生成参考音频 → assets/voice/jarvis_ref.wav
+    2. Base 模型 speaker encoder 提取 embedding → assets/voice/jarvis_embedding.npy
+    3. 运行时用 Base 模型 + ref_audio 合成，音色固定不漂移
+
+重新生成音色：python scripts/gen_jarvis_ref.py
 """
 
-# 贾维斯声音描述（英文，给 Qwen3-TTS VoiceDesign 用）
+from pathlib import Path
+
+# ── 音色资源路径 ──
+_VOICE_DIR = Path(__file__).parent / "assets" / "voice"
+REF_AUDIO_PATH = _VOICE_DIR / "jarvis_ref.wav"
+EMBEDDING_PATH = _VOICE_DIR / "jarvis_embedding.npy"
+
+# ── 模型配置 ──
+# 主力：Base 模型（有 speaker encoder，支持 ref_audio 音色锁定）
+BASE_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+
+# 保留 VoiceDesign 配置（仅用于重新生成参考音频）
+VOICE_DESIGN_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+
+# VoiceDesign instruct（仅 gen_jarvis_ref.py 使用）
 JARVIS_VOICE_INSTRUCT = (
     "A deep, warm, mature male voice with expressive intonation and natural pitch variation. "
     "Slightly faster than normal speaking pace, energetic but controlled. "
@@ -27,9 +48,5 @@ JARVIS_VOICE_INSTRUCT = (
     "Speaking Chinese."
 )
 
-# TTS 模型配置
-VOICE_DESIGN_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
-CUSTOM_VOICE_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
-
-# 降级音色（VoiceDesign 不可用时用 CustomVoice）
-FALLBACK_SPEAKER = "aiden"
+# 参考音频对应的文本（用于 ICL 模式）
+REF_TEXT = "所有系统运行正常，随时待命。"
