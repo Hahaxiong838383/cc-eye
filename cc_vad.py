@@ -73,7 +73,7 @@ def _ensure_model() -> Path:
 
 class SileroVAD:
     """
-    Silero VAD 封装，基于 ONNX Runtime 推理。
+    Silero VAD 封装，基于 PyTorch 推理（官方推荐方式）。
 
     核心方法:
         is_speech(chunk)       — 判断是否包含人声
@@ -96,39 +96,32 @@ class SileroVAD:
             raise ValueError(
                 f"Silero VAD 仅支持 16kHz 采样率，收到 {sample_rate}"
             )
-        if window_size not in (256, 512, 768, 1024, 1536):
-            raise ValueError(
-                f"window_size 必须是 256/512/768/1024/1536 之一，收到 {window_size}"
-            )
 
         self.threshold = threshold
         self.sample_rate = sample_rate
         self.window_size = window_size
 
-        # 加载 ONNX 模型
-        model_path = _ensure_model()
-        opts = ort.SessionOptions()
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
-        opts.log_severity_level = 3  # 抑制 onnxruntime 日志
-        self._session = ort.InferenceSession(
-            str(model_path), sess_options=opts
+        # 加载 torch 版 Silero VAD
+        import torch
+        self._torch = torch
+        self._model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True,
         )
-
-        # Silero VAD 内部状态（LSTM hidden state）
-        # 模型需要 state 张量，shape = (2, 1, 128)
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._model.eval()
 
         logger.info(
-            "SileroVAD 就绪: threshold=%.2f, window=%d samples (%.0fms)",
+            "SileroVAD 就绪 (torch): threshold=%.2f, window=%d samples (%.0fms)",
             threshold,
             window_size,
             window_size / sample_rate * 1000,
         )
 
     def reset(self) -> None:
-        """重置内部 LSTM 状态（新的对话轮次时调用）。"""
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        """重置内部状态（新的对话轮次时调用）。"""
+        self._model.reset_states()
 
     def get_speech_prob(self, audio_chunk: np.ndarray) -> float:
         """
@@ -148,26 +141,8 @@ class SileroVAD:
                 f"chunk 长度必须为 {self.window_size}，收到 {len(chunk)}"
             )
 
-        # Silero VAD ONNX 输入:
-        #   input: float32 [1, window_size]
-        #   state: float32 [2, 1, 128]  (LSTM hidden state)
-        #   sr:    int64   scalar
-        input_data = chunk.reshape(1, -1)
-        sr = np.array(self.sample_rate, dtype=np.int64)
-
-        outputs = self._session.run(
-            None,
-            {
-                "input": input_data,
-                "state": self._state,
-                "sr": sr,
-            },
-        )
-
-        # 输出: [output (float32 [1,1]), stateN (float32 [2,1,128])]
-        prob = float(outputs[0].item())
-        self._state = outputs[1]
-
+        tensor = self._torch.from_numpy(chunk)
+        prob = self._model(tensor, self.sample_rate).item()
         return prob
 
     def is_speech(self, audio_chunk: np.ndarray) -> bool:
@@ -189,8 +164,8 @@ class _SegState(Enum):
 class SpeechSegmenterConfig:
     """SpeechSegmenter 配置。"""
     threshold: float = 0.5          # 人声判定阈值
-    min_speech_ms: int = 300        # 最短有效语音段（毫秒）
-    min_silence_ms: int = 600       # 静音多久算说完（毫秒）
+    min_speech_ms: int = 200        # 最短有效语音段（毫秒）
+    min_silence_ms: int = 300       # 静音多久算说完（毫秒）— 极速响应
     sample_rate: int = 16000
     window_size: int = 512          # Silero VAD 帧大小
     pre_speech_ms: int = 200        # 语音前缓冲（保留起始音）

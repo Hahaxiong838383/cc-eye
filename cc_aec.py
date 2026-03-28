@@ -106,11 +106,27 @@ class EchoCanceller:
             print(f"[cc-aec] 加载参考信号失败: {e}")
             return False
 
+    def feed_reference_pcm(self, chunk: np.ndarray) -> None:
+        """
+        实时喂入参考信号 PCM（来自 InterruptablePlayer 的每帧回调）。
+
+        用于新架构：播放器每帧回调 → 降采样到 16kHz → 喂给 AEC。
+        替代旧的 set_reference(file) 方式。
+        """
+        with self._lock:
+            if self._reference is None:
+                self._reference = chunk.astype(np.float32)
+            else:
+                self._reference = np.concatenate([self._reference, chunk.astype(np.float32)])
+            self._active = True
+
     def start_playback(self) -> None:
-        """标记播放开始"""
+        """标记播放开始，重置参考信号"""
         with self._lock:
             self._is_playing = True
             self._ref_pos = 0
+            self._reference = None  # 清空旧参考，等 feed_reference_pcm 实时填充
+            self._active = True
 
     def stop_playback(self) -> None:
         """标记播放结束，进入尾部消散期"""

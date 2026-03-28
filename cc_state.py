@@ -56,15 +56,21 @@ class Event(Enum):
 
 TRANSITIONS: Dict[Tuple[State, Event], State] = {
     (State.IDLE, Event.SPEECH_START):        State.LISTENING,
+    (State.IDLE, Event.TIMEOUT):             State.IDLE,
+    (State.IDLE, Event.ERROR):               State.IDLE,
     (State.LISTENING, Event.SPEECH_END):     State.PROCESSING,
     (State.LISTENING, Event.TIMEOUT):        State.IDLE,
     (State.PROCESSING, Event.FIRST_AUDIO):   State.SPEAKING,
     (State.PROCESSING, Event.TOOL_CALL):     State.TOOL_CALLING,
+    (State.PROCESSING, Event.SPEECH_END):     State.PROCESSING,  # 忽略重复
+    (State.PROCESSING, Event.TIMEOUT):        State.IDLE,
     (State.PROCESSING, Event.ERROR):         State.IDLE,
     (State.SPEAKING, Event.BARGE_IN):        State.INTERRUPTED,
     (State.SPEAKING, Event.PLAY_DONE):       State.IDLE,
     (State.INTERRUPTED, Event.SPEECH_START): State.LISTENING,
+    (State.INTERRUPTED, Event.SPEECH_END):   State.IDLE,
     (State.INTERRUPTED, Event.TIMEOUT):      State.IDLE,
+    (State.INTERRUPTED, Event.ERROR):        State.IDLE,
     (State.TOOL_CALLING, Event.TOOL_DONE):   State.SPEAKING,
     (State.TOOL_CALLING, Event.ERROR):       State.IDLE,
 }

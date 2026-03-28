@@ -49,6 +49,7 @@ from cc_events import (
 )
 from cc_listen import SpeechSegment, _transcribe
 from cc_player import InterruptablePlayer, tts_to_pcm_stream, _mp3_bytes_to_pcm
+from cc_tts_local import local_tts_to_pcm, preload as preload_tts
 from cc_state import Event, State, StateMachine
 from cc_vad import SileroVAD, SpeechSegmenter
 from cc_voice import is_echo
@@ -74,11 +75,15 @@ VOICE = "zh-CN-YunjianNeural"
 RATE = "-5%"
 PITCH = "-10Hz"
 
-# barge-in 防抖：连续多少帧人声才算真正打断
-BARGE_IN_FRAMES_REQUIRED = 3  # 3 帧 × 32ms ≈ 96ms
+# barge-in 防抖
+BARGE_IN_FRAMES_REQUIRED = 6   # 6 帧 × 32ms ≈ 192ms（防止扬声器回声误触发）
+BARGE_IN_VAD_THRESHOLD = 0.75  # 播放中要求更高 VAD 置信度（正常 0.5，播放中 0.75）
+BARGE_IN_ENERGY_MIN = 0.01     # 播放中要求最低能量（过滤扬声器低能量回声）
+BARGE_IN_GRACE_MS = 500        # 播放开始后的免打扰期（毫秒，让 AEC 适应）
 
 # 唤醒词
 WAKE_WORDS = ["贾维斯", "jarvis", "嘉维斯", "贾维丝"]
+ACTIVE_SESSION_TIMEOUT = 120.0  # 唤醒后 2 分钟内免唤醒词
 
 # 主动交互
 PROACTIVE_COOLDOWN = 30.0     # 主动说话冷却（秒）
@@ -108,8 +113,9 @@ class AudioEngine:
         # ── 处理队列（音频线程 → 处理线程）──
         self._segment_queue: queue.Queue = queue.Queue()
 
-        # ── barge-in 防抖计数器 ──
+        # ── barge-in 防抖 ──
         self._barge_in_count = 0
+        self._play_start_time: float = 0.0  # 播放开始时间戳
 
         # ── 停止信号 ──
         self.stop_event = threading.Event()
@@ -129,6 +135,14 @@ class AudioEngine:
         self._recent_tts_texts: list = []
         self._tts_lock = threading.Lock()
 
+        # ── 活跃会话：唤醒后免唤醒词 ──
+        self._last_wake_time: float = 0.0
+
+        # ── 播放后冷却：避免拾到自己的 TTS 余音 ──
+        self._tts_playing: bool = False   # TTS 正在播放
+        self._play_end_time: float = 0.0
+        self._POST_PLAY_COOLDOWN = 1.5  # 播完后 1.5 秒内忽略 VAD
+
     # ════════════════════════════════════════════
     #  启动 / 停止
     # ════════════════════════════════════════════
@@ -142,6 +156,13 @@ class AudioEngine:
         print("  眼：摄像头场景感知（camera_daemon）")
         print("  Ctrl+C 退出")
         print("=" * 50)
+
+        # 预加载模型（后台线程，不阻塞启动）
+        def _preload():
+            from cc_listen import _get_sensevoice
+            _get_sensevoice()
+            preload_tts()
+        threading.Thread(target=_preload, daemon=True, name="model-preload").start()
 
         # 启动常驻麦克风
         self.mic_stream = sd.InputStream(
@@ -225,20 +246,12 @@ class AudioEngine:
         if self.player.is_playing or self.aec.is_active:
             chunk = self.aec.process(chunk)
 
-        # barge-in 检测：播放中检测到人声 → 打断
+        # TTS 播放中或冷却期：完全跳过，避免回声
+        if self._tts_playing:
+            return
         if self.state_machine.current_state == State.SPEAKING:
-            if self.vad.is_speech(chunk):
-                self._barge_in_count += 1
-                if self._barge_in_count >= BARGE_IN_FRAMES_REQUIRED:
-                    # 连续 3 帧人声，确认打断
-                    self.player.stop()
-                    self.state_machine.transition(Event.BARGE_IN)
-                    self._barge_in_count = 0
-                    self.segmenter.reset()  # 重置 segmenter，准备接收新语音
-                    logger.info("barge-in 触发：用户打断播放")
-            else:
-                self._barge_in_count = 0
-            # 播放中不喂 segmenter，避免录到自己的声音
+            return
+        if (time.time() - self._play_end_time) < self._POST_PLAY_COOLDOWN:
             return
 
         # 非播放状态：重置 barge-in 计数
@@ -296,9 +309,12 @@ class AudioEngine:
         """处理一个完整语音段：STT → 唤醒词 → LLM → TTS"""
 
         # 保存音频 → SenseVoice STT
+        t0 = time.time()
         sf.write(AUDIO_PATH, audio, SAMPLE_RATE)
         duration = len(audio) / SAMPLE_RATE
         segment = _transcribe(AUDIO_PATH, duration)
+        t_stt = time.time() - t0
+        print(f"[perf] STT: {t_stt:.2f}s (音频 {duration:.1f}s)")
 
         if not segment or not segment.text:
             self.state_machine.transition(Event.ERROR)
@@ -348,29 +364,54 @@ class AudioEngine:
 
     def _check_wake_word(self, text: str) -> tuple:
         """
-        检查唤醒词。
+        检查唤醒词。唤醒后 ACTIVE_SESSION_TIMEOUT 内免唤醒词。
 
         Returns:
             (wake_hit: bool, clean_text: str)
         """
         text_lower = text.lower()
+
+        # 显式唤醒词
         for w in WAKE_WORDS:
             if w in text_lower:
                 clean = text_lower.replace(w, "").strip()
+                clean = clean.strip("。？！，、；：. ")
+                self._last_wake_time = time.time()
+                if not clean:
+                    # 只说了唤醒词，直接本地应答，不走 LLM
+                    self._play_sentence("在。")
+                    return False, ""  # 返回 False 跳过后续处理
                 return True, clean
+
+        # 活跃会话期间免唤醒词
+        if (time.time() - self._last_wake_time) < ACTIVE_SESSION_TIMEOUT:
+            return True, text
+
         return False, text
 
-    def _is_own_echo(self, text: str, threshold: float = 0.5) -> bool:
+    def _is_own_echo(self, text: str) -> bool:
         """检查是否是自己播放的 TTS 回声"""
-        if not text or len(text) < 3:
+        if not text or len(text) < 2:
             return False
         with self._tts_lock:
             recent = list(self._recent_tts_texts)
+        # 清理标点
+        strip_chars = "。？！，、；：. ？！"
+        clean = text.strip(strip_chars).replace(" ", "")
+        if not clean:
+            return False
         for tts_text in recent:
-            common = sum(1 for c in text if c in tts_text)
-            ratio = common / len(text)
-            if ratio > threshold:
+            tts_clean = tts_text.strip(strip_chars).replace(" ", "")
+            if not tts_clean:
+                continue
+            # 子串匹配
+            if clean in tts_clean or tts_clean in clean:
                 return True
+            # 模糊匹配：超过 60% 字符重叠且文本短（STT 识别 TTS 输出常有偏差）
+            if len(clean) <= 8:
+                common = sum(1 for c in clean if c in tts_clean)
+                if common / len(clean) > 0.6:
+                    return True
         return False
 
     def _record_tts_text(self, text: str) -> None:
@@ -401,15 +442,12 @@ class AudioEngine:
 
             # 用 edge-tts 合成 → InterruptablePlayer 播放
             try:
-                self._play_sentence(sentence)
-
-                # 第一句播放开始时，转换状态
+                # 第一句开始前转状态
                 if not first_audio_sent:
                     self.state_machine.transition(Event.FIRST_AUDIO)
                     first_audio_sent = True
 
-                # 等当前句播完再播下一句（除非被打断）
-                self.player.wait()
+                self._play_sentence(sentence)
 
             except Exception as e:
                 logger.error("TTS 播放异常: %s", e)
@@ -422,43 +460,24 @@ class AudioEngine:
             self.state_machine.transition(Event.ERROR)
 
     def _play_sentence(self, text: str) -> None:
-        """
-        合成一句话并通过 InterruptablePlayer 播放。
-
-        使用 edge-tts 合成 mp3 → 解码为 PCM → 播放。
-        """
-        # 收集 edge-tts mp3 chunks
-        mp3_chunks = []
-
-        async def _collect():
-            async for chunk_data in tts_to_pcm_stream(text, VOICE, RATE, PITCH):
-                mp3_chunks.append(chunk_data)
-
-        # 在新的 event loop 中运行（处理线程没有 event loop）
+        """Qwen3-TTS MLX 本地合成 + sd.play 直接播放"""
         try:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(_collect())
-            loop.close()
+            t0 = time.time()
+            pcm, sr = local_tts_to_pcm(text)
+            elapsed_ms = (time.time() - t0) * 1000
+            print(f"[perf] TTS: {elapsed_ms:.0f}ms")
         except Exception as e:
-            logger.error("edge-tts 合成失败: %s", e)
+            logger.error("本地 TTS 失败: %s", e)
             return
 
-        if not mp3_chunks:
-            return
-
-        # 拼接 mp3 → 解码 PCM
-        mp3_all = b"".join(mp3_chunks)
-        try:
-            pcm = _mp3_bytes_to_pcm(mp3_all, 24000)
-        except Exception as e:
-            logger.error("MP3 解码失败: %s", e)
-            return
-
-        # 通知 AEC 开始播放
-        self.aec.start_playback()
-
-        # 播放 PCM
-        self.player.play_pcm(pcm, sample_rate=24000)
+        # 播放前静音麦克风，播放后冷却
+        self._tts_playing = True
+        self.segmenter.reset()  # 清空缓冲的回声
+        sd.play(pcm, sr)
+        sd.wait()
+        self._tts_playing = False
+        self._play_end_time = time.time()
+        self.segmenter.reset()  # 再次清空残留回声
 
     # ════════════════════════════════════════════
     #  播放器回调（AEC 联动）
@@ -466,6 +485,7 @@ class AudioEngine:
 
     def _on_play_start(self) -> None:
         """播放开始回调"""
+        self._play_start_time = time.time()
         logger.debug("播放开始")
 
     def _on_play_stop(self) -> None:
@@ -485,9 +505,7 @@ class AudioEngine:
             indices = np.arange(0, len(frame), 1 / ratio).astype(int)
             indices = indices[indices < len(frame)]
             resampled = frame[indices]
-            # 喂给 AEC 参考缓冲
-            # AEC 的 process() 会在 _audio_callback 中使用这些参考信号
-            # 这里不需要额外操作，AEC.start_playback() 已经标记了状态
+            self.aec.feed_reference_pcm(resampled)
 
     # ════════════════════════════════════════════
     #  状态机回调
