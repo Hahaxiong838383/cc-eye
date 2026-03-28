@@ -44,12 +44,14 @@ MOTION_BIG = 16.0               # 帧差 > 此值 = 大幅运动，触发精扫
 MOTION_GATE = 2.5               # 帧差 < 此值 = 完全静态（跳过人脸检测）
 
 # 分频控制
-FACE_CHECK_EVERY = 2            # 正常每 N tick 检测人脸
-FACE_CHECK_STATIC = 5           # 静态场景每 N tick 检测人脸
+PERSON_CHECK_EVERY = 3          # 正常每 N tick 检测人体（YOLO）
+PERSON_CHECK_STATIC = 6         # 静态场景每 N tick 检测人体
+FACE_ID_EVERY = 20              # 每 N tick 做一次人脸身份识别（仅在有人时）
+PERSON_LEFT_GRACE = 5           # 连续 N 次未检到人才判定离开（防抖）
 
 # 双模型策略
 FAST_SCAN_INTERVAL = 10         # moondream 快扫间隔（秒）
-DETAIL_SCAN_INTERVAL = 120      # minicpm-v 定时精扫间隔（秒）
+DETAIL_SCAN_INTERVAL = 60       # minicpm-v 定时精扫间隔（秒）
 MAX_EVENTS = 200
 
 
@@ -142,10 +144,8 @@ def init_vision_models() -> tuple:
 
 
 FAST_SCAN_PROMPT = (
-    "Describe what you see briefly: "
-    "1) Is anyone present? What are they doing? "
-    "2) Key objects visible. "
-    "One sentence max."
+    "Describe the scene in one sentence: "
+    "what is the person doing, and what key objects are visible."
 )
 
 # ── 人脸识别（懒加载）──
@@ -245,7 +245,16 @@ def main():
     for _ in range(5):
         cap.read()
 
-    # Haar Cascade
+    # YOLO 人体检测（替代 Haar 正脸，低头/侧身/背面都能检测）
+    yolo_model = None
+    try:
+        from ultralytics import YOLO
+        yolo_model = YOLO("yolov8n.pt")
+        print("[cc-eye daemon] YOLO 人体检测器已加载 (yolov8n)")
+    except Exception as e:
+        print(f"[cc-eye daemon] YOLO 加载失败，降级到 Haar: {e}")
+
+    # Haar Cascade（仅用于人脸身份识别，不再用于人体存在判断）
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     )
@@ -257,7 +266,8 @@ def main():
 
     # 状态
     prev_motion_gray = None
-    prev_face_count = 0
+    prev_person_present = False     # YOLO 人体检测结果（替代 prev_face_count）
+    person_miss_count = 0           # 连续未检到人的次数（防抖用）
     tick = 0
     last_fast_scan = 0.0
     last_detail_scan = 0.0
@@ -309,49 +319,71 @@ def main():
 
             prev_motion_gray = motion_gray
 
-            # ── 3. 人脸检测（分频 + 变化门控）──
-            # 静态场景：每 5s 检测一次（省 CPU）
-            # 有运动：每 2s 检测一次
-            face_interval = FACE_CHECK_STATIC if is_static else FACE_CHECK_EVERY
-            should_check_face = (tick % face_interval == 0) or is_big_motion
+            # ── 3. 人体检测（YOLO person，分频 + 防抖）──
+            # YOLO 检测整个人体，不依赖正脸朝向
+            # 低头/侧身/背面都能检到，比 Haar 正脸更可靠
+            person_interval = PERSON_CHECK_STATIC if is_static else PERSON_CHECK_EVERY
+            should_check_person = (tick % person_interval == 0) or is_big_motion
 
-            if should_check_face:
-                # 用 0.5× 缩放的灰度图做人脸检测
-                small_gray = cv2.resize(
-                    gray_full, (0, 0), fx=0.5, fy=0.5
-                )
-                faces = face_cascade.detectMultiScale(
-                    small_gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(30, 30),
-                )
-                face_count = len(faces)
+            if should_check_person:
+                person_detected = False
+                person_count = 0
 
-                if face_count > 0 and prev_face_count == 0:
+                if yolo_model is not None:
+                    # YOLO 推理：只检测 class 0 (person)，320px 输入，静默模式
+                    results = yolo_model(
+                        frame, classes=[0], imgsz=320,
+                        verbose=False, conf=0.4,
+                    )
+                    person_count = len(results[0].boxes)
+                    person_detected = person_count > 0
+                else:
+                    # 降级：用 Haar 正脸检测（旧逻辑）
+                    small_gray = cv2.resize(
+                        gray_full, (0, 0), fx=0.5, fy=0.5
+                    )
+                    faces = face_cascade.detectMultiScale(
+                        small_gray, scaleFactor=1.1,
+                        minNeighbors=5, minSize=(30, 30),
+                    )
+                    person_count = len(faces)
+                    person_detected = person_count > 0
+
+                # 状态转换：无人 → 有人
+                if person_detected and not prev_person_present:
+                    person_miss_count = 0
                     _recognized_people.clear()
                     names = recognize_faces(frame)
                     _recognized_people.extend(names)
                     who = f"（{', '.join(names)}）" if names else ""
-                    log_event("person_appeared", f"检测到 {face_count} 张脸{who}")
-                    print(f"[cc-eye daemon] 有人来了！{who}({face_count} 张脸)")
+                    log_event("person_appeared", f"检测到 {person_count} 人{who}")
+                    print(f"[cc-eye daemon] 有人来了！{who}({person_count} 人)")
                     Path("/tmp/cc-eye-person-arrived.flag").write_text(
                         datetime.now().isoformat()
                     )
                     pending_detail = True
+                    prev_person_present = True
 
-                elif face_count > 0 and tick % (FACE_CHECK_EVERY * 20) == 0:
+                # 定期更新身份识别（有人在时，每 FACE_ID_EVERY tick 识别一次）
+                elif person_detected and tick % FACE_ID_EVERY == 0:
                     names = recognize_faces(frame)
                     if names:
                         _recognized_people.clear()
                         _recognized_people.extend(names)
 
-                elif face_count == 0 and prev_face_count > 0:
-                    log_event("person_left", "画面中无人")
-                    print("[cc-eye daemon] 人走了")
-                    _recognized_people.clear()
+                # 状态转换：有人 → 无人（带防抖，连续 N 次未检到才判定离开）
+                elif not person_detected and prev_person_present:
+                    person_miss_count += 1
+                    if person_miss_count >= PERSON_LEFT_GRACE:
+                        log_event("person_left", "画面中无人")
+                        print("[cc-eye daemon] 人走了")
+                        _recognized_people.clear()
+                        prev_person_present = False
+                        person_miss_count = 0
 
-                prev_face_count = face_count
+                # 检测到人，重置 miss 计数
+                if person_detected:
+                    person_miss_count = 0
 
             now = time.time()
 
@@ -367,7 +399,7 @@ def main():
             if fast_scanner:
                 desc = fast_scanner.poll()
                 if desc:
-                    save_scene(desc, prev_face_count, people=_recognized_people)
+                    save_scene(desc, 1 if prev_person_present else 0, people=_recognized_people)
                     log_event("fast_scan", desc[:100])
                     print(f"[cc-eye daemon] 快扫: {desc[:60]}...")
 
@@ -388,7 +420,7 @@ def main():
             if detail_scanner:
                 desc = detail_scanner.poll()
                 if desc:
-                    save_scene(desc, prev_face_count, people=_recognized_people)
+                    save_scene(desc, 1 if prev_person_present else 0, people=_recognized_people)
                     log_event("detail_scan", desc[:100])
                     print(f"[cc-eye daemon] 精扫: {desc[:80]}...")
 
@@ -397,7 +429,7 @@ def main():
             if fps_counter >= 30:
                 elapsed = time.time() - fps_start
                 actual_fps = fps_counter / elapsed if elapsed > 0 else 0
-                print(f"[cc-eye daemon] fps={actual_fps:.1f} diff={mean_diff:.1f} faces={prev_face_count}")
+                print(f"[cc-eye daemon] fps={actual_fps:.1f} diff={mean_diff:.1f} person={'Y' if prev_person_present else 'N'}")
                 fps_counter = 0
                 fps_start = time.time()
 

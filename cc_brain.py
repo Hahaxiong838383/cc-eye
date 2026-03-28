@@ -24,8 +24,11 @@ from cc_tools import try_tool
 _INTERACTION_LOG = Path("/tmp/cc-eye-interactions.jsonl")
 
 def _log_interaction(user_text: str, route: str, local_reply: str, cloud_reply: str, latency: float):
-    """记录每次交互，供进化自查分析"""
+    """记录每次交互，供进化自查分析 + 记忆桥接"""
     from datetime import datetime
+    # 获取当前场景摘要（隐私红线：只存文字描述，不存图像路径）
+    scene = get_scene_context()
+    scene_summary = (scene.get("description", "") if scene else "")[:120]
     entry = {
         "ts": datetime.now().isoformat(),
         "input": user_text[:100],
@@ -33,6 +36,7 @@ def _log_interaction(user_text: str, route: str, local_reply: str, cloud_reply: 
         "local_reply": (local_reply or "")[:80],
         "cloud_reply": (cloud_reply or "")[:80],
         "latency_ms": int(latency * 1000),
+        "scene": scene_summary,
     }
     try:
         with open(_INTERACTION_LOG, "a") as f:
@@ -515,8 +519,10 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         while not cloud_done.is_set() or not cloud_sentences.empty():
             try:
                 sentence = cloud_sentences.get(timeout=0.3)
-                # 云端质量门控：丢弃残句和过短回复
-                if len(sentence.strip()) < 5 or sentence.strip().endswith(('吧。', '的。', '了。')) and len(sentence.strip()) < 8:
+                # 云端质量门控：只丢弃纯标点残片（<2 有效字符）
+                clean = sentence.strip()
+                effective_len = len(re.sub(r'[。？！，、；：\s]', '', clean))
+                if effective_len < 2:
                     continue
                 yielded = True
                 yield sentence
