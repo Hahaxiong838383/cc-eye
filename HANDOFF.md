@@ -1,77 +1,109 @@
-# 贾维斯全双工 MVP — 开发交接
+# 贾维斯 V3.3 — 开发交接
 
-> 给另一台电脑上的 Claude Code 看的。读完这个文件就能接着干。
+> 给新 session 或另一台电脑的 Claude Code 看的。读完就能续上。
 
-## 刚完成的事（2026-03-28 07:00-09:00）
-
-半双工→全双工语音交互架构升级，4 个新模块 + 1 个核心重构：
-
-| 文件 | 行数 | 功能 | 状态 |
-|------|------|------|------|
-| `cc_vad.py` | 420 | Silero VAD ONNX（0.07ms/帧，替代能量阈值） | ✅ 导入验证通过 |
-| `cc_state.py` | 231 | 6态状态机（12条转移规则） | ✅ 测试通过 |
-| `cc_player.py` | 416 | InterruptablePlayer（<50ms stop，替代afplay） | ✅ 语法通过 |
-| `cc_interact.py` | 676 | AudioEngine 全双工引擎（重写） | ✅ 导入通过 |
-| `cc_memory_bridge.py` | 294 | 每日感知汇总→mycc记忆 | ✅ 已有 |
-
-## 架构变化
+## 当前架构（2026-03-29）
 
 ```
-旧：listen_once() 阻塞录音 → STT → LLM → afplay 阻塞播放（半双工，不可打断）
-新：常驻 InputStream callback → Silero VAD → SpeechSegmenter → queue → 处理线程 → InterruptablePlayer（全双工，可打断）
+┌─ 耳朵 ─────────────────┐  ┌─ 眼睛 ──────────────────┐
+│ Swift VP AEC 硬件回声消除 │  │ 摄像头 640×480            │
+│ → Qwen3-ASR 0.6B MLX    │  │ → Qwen2-VL-2B 快扫(10s)  │
+│   (STT 130ms)            │  │ → Qwen2.5-VL-7B 精扫(60s)│
+└──────────┬──────────────┘  └────────────┬─────────────┘
+           ↓                              ↓
+      ┌─ 大脑（三层路由）──────────────────────────────┐
+      │ 1. 预缓存过渡词（0ms）                          │
+      │ 2. oMLX Qwen3.5-4B 本地（300ms 首 token）      │
+      │ 3. Gemini 2.5 FL / MiniMax M2.7 云端            │
+      │ + 视觉场景注入 prompt                           │
+      └───────────────────┬────────────────────────────┘
+                          ↓
+      ┌─ 嘴巴 ──────────────────────────────────────────┐
+      │ Qwen3-TTS 1.7B VoiceDesign（定制贾维斯声音）     │
+      │ → 常驻 OutputStream（可打断，无破音）             │
+      │ + 73 条预缓存（磁盘固化，启动秒加载）            │
+      └──────────────────────────────────────────────────┘
 ```
 
-核心：**麦克风永不关，播放器可随时停，barge-in 3帧防抖**
-
-## 依赖
-
-venv 里需要额外安装：
-```bash
-pip install pydub
-```
-Silero VAD ONNX 模型在首次运行时自动下载到 `.venv/models/silero_vad.onnx`。
-其他依赖（onnxruntime, sounddevice, edge-tts, funasr）已在 requirements.txt 中。
-
-## 已知问题（等待实测修复）
-
-1. **未实测过真实对话**：代码全部通过导入验证和 AST 检查，但还没跑过完整的"说话→识别→回复→打断"流程
-2. **sounddevice 必须前台终端运行**：后台进程无法获取 macOS 麦克风权限（PortAudio -9986）
-3. **AEC 参考信号降采样**：`_on_player_pcm_frame` 里 24kHz→16kHz 的降采样逻辑写了但没实际喂给 AEC（需要补全）
-4. **edge-tts 合成方式**：当前 `_play_sentence` 先收集所有 mp3 chunks 再解码播放（非流式），首包时间可能偏高，后续改为真正流式
-
-## 后续待办（按优先级）
-
-### P0：实测修 bug
-- [ ] 在终端跑 `python cc_interact.py`，说"贾维斯你好"，观察状态转移日志
-- [ ] 确认 VAD 不误触（空房间不触发）
-- [ ] 确认 STT 识别正确
-- [ ] 确认 TTS 播放正常（sounddevice OutputStream 能出声）
-- [ ] 测试 barge-in（播放中说话打断）
-
-### P1：功能增强
-- [ ] 摄像头+语音联合理解（"这是什么" → 截帧 + Vision API）
-- [ ] 情感语调 TTS（Fish Speech / ChatTTS 替代 edge-tts）
-- [ ] 更自然的 turn-taking（语义级 endpointing）
-
-### P2：体验优化
-- [ ] 去掉唤醒词（Porcupine 音频级检测）
-- [ ] 声纹识别（区分用户）
-- [ ] AEC 块级升级（当前逐样本循环太慢）
-
-## 启动命令
+## 启动步骤
 
 ```bash
+# 1. 启动 oMLX（本地 LLM 服务）
 cd ~/mycc/2-Projects/cc-eye
-source .venv/bin/activate
-python cc_interact.py
+PATH=".venv/bin:$PATH" .venv/bin/omlx serve --model-dir ~/models --port 8000 &
+
+# 2. 启动贾维斯
+PATH=".venv/bin:$PATH" .venv/bin/python cc_jarvis_v3.py
 ```
 
-## 关键代码入口
+## 关键文件
 
-- `cc_interact.py:88` — `AudioEngine.__init__`
-- `cc_interact.py:210` — `_audio_callback`（32ms/帧，VAD + AEC + barge-in）
-- `cc_interact.py:295` — `_handle_segment`（STT → 唤醒词 → LLM → TTS）
-- `cc_interact.py:383` — `_process_speech`（流式 LLM → 句级 TTS 播放）
-- `cc_vad.py:74` — `SileroVAD` 类
-- `cc_state.py:57` — `TRANSITIONS` 转移规则表
-- `cc_player.py:66` — `InterruptablePlayer` 类
+| 文件 | 功能 |
+|------|------|
+| `cc_jarvis_v3.py` | 主程序：音频引擎+VAD+状态机+打断+对话 |
+| `cc_brain.py` | LLM 路由：本地4B + Gemini + MiniMax |
+| `cc_tts_local.py` | TTS：VoiceDesign 1.7B + 预缓存 |
+| `cc_stt_mlx.py` | STT：Qwen3-ASR MLX |
+| `cc_vision_mlx.py` | 视觉：Qwen2-VL-2B + Qwen2.5-VL-7B |
+| `cc_voice_profile.py` | 贾维斯声音描述（VoiceDesign instruct） |
+| `cc_audio_bridge.swift` | Swift VP AEC 桥接 |
+| `cc_audio_engine.py` | Python 端桥接封装 |
+| `cc_audio_out.py` | 常驻 OutputStream 播放器 |
+
+## API Keys（.env，gitignore 保护）
+
+- `MINIMAX_API_KEY` — MiniMax M2.7 深度思考 + 联网搜索
+- `GEMINI_API_KEY` — Gemini 2.5 Flash-Lite 快速响应
+
+## 本地模型（~/models/ + HF 缓存）
+
+| 模型 | 用途 | 位置 |
+|------|------|------|
+| Qwen3.5-4B-MLX-4bit | 本地 LLM（oMLX） | ~/models/ |
+| Qwen3.5-9B-4bit | 备用 LLM（oMLX） | ~/models/ |
+| Qwen3-ASR-0.6B-8bit | STT | HF 缓存 |
+| Qwen3-TTS-1.7B-VoiceDesign-8bit | TTS | HF 缓存 |
+| Qwen3-TTS-1.7B-CustomVoice-8bit | TTS 降级 | HF 缓存 |
+| Qwen2-VL-2B-Instruct-4bit | 视觉快扫 | HF 缓存 |
+| Qwen2.5-VL-7B-Instruct-4bit | 视觉精扫 | HF 缓存 |
+
+## 三层 LLM 路由
+
+```
+所有查询：
+  → 预缓存过渡词秒播（0ms）
+  → 4B 本地流式（300ms 首 token）
+  → 需要联网/深度时 Gemini/MiniMax 并行补充
+```
+
+- 4B prompt：精简 few-shot（10字以内，像朋友聊天）
+- 云端 prompt：完整贾维斯人格 + 记忆 + 场景 + 能力
+
+## VP AEC 回声消除
+
+- Swift `cc_audio_bridge` 启用 Voice Processing IO
+- ducking 设为 `.min`（最小音量衰减）
+- 回声从 0.05 降到 ~0.009（消 80%）
+- barge-in 纯能量动态阈值（播放能量 × 0.3 + 0.03）
+
+## TTS 预缓存
+
+- 73 条常用短句（≥3 字），VoiceDesign 1.7B 生成
+- 固化到 `.venv/cache/tts_cache.npz`
+- 首次启动合成（几分钟），之后秒加载
+- 换音色需删缓存重新生成
+
+## 已知问题
+
+1. **回声消除不完美**：VP 消 80%，剩余靠文本级过滤 + 动态阈值
+2. **本地和云端衔接**：偶有断档，过渡词填补
+3. **TTS 音色微差**：VoiceDesign 1.7B 每次合成有轻微随机性
+4. **视觉 GPU 争抢**：视觉模型和 STT/TTS 共用 MLX 锁串行
+
+## 待优化（P2）
+
+- TTS 预缓存自进化（按使用频率增量更新）
+- 意图分类路由（替代字数规则）
+- 视觉主动交互（人到达/离开触发问候）
+- 方案 C：中文 S2S 模型跟踪（PersonaPlex 等）
+- oMLX KV 缓存优化（system prompt 固定部分缓存）
