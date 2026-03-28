@@ -29,3 +29,4 @@ face_data/*.npy
 
 # 人脸照片和模型（隐私敏感）
 faces/
+.conda/

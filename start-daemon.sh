@@ -3,7 +3,7 @@
 # launchd 进程没有摄像头权限，但 Terminal.app 有。
 # 用 osascript 让 Terminal 执行脚本，摄像头权限随 Terminal 走。
 
-DAEMON_CMD="cd ~/mycc/2-Projects/cc-eye && source .venv/bin/activate && python camera_daemon.py"
+DAEMON_CMD="cd ~/mycc/2-Projects/cc-eye && .venv/bin/python camera_daemon.py"
 
 # 检查 daemon 是否已在运行
 if pgrep -f "python camera_daemon.py" > /dev/null 2>&1; then

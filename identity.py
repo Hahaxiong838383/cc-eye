@@ -52,14 +52,13 @@ def _extract_embedding(frame: np.ndarray) -> Optional[np.ndarray]:
             img_path=frame,
             model_name=_MODEL_NAME,
             detector_backend=_DETECTOR_BACKEND,
-            enforce_detection=True,
+            enforce_detection=False,
         )
-        if len(results) != 1:
-            # 跳过没有人脸或多张人脸的帧
+        if len(results) < 1:
             return None
+        # 取第一张脸（通常是最大的）
         return np.array(results[0]["embedding"], dtype=np.float64)
     except (ValueError, Exception) as exc:
-        # enforce_detection=True 在没找到人脸时抛 ValueError
         logger.debug("提取 embedding 失败: %s", exc)
         return None
 
@@ -76,11 +75,12 @@ def _extract_all_embeddings(frame: np.ndarray) -> List[Tuple[np.ndarray, dict]]:
             img_path=frame,
             model_name=_MODEL_NAME,
             detector_backend=_DETECTOR_BACKEND,
-            enforce_detection=True,
+            enforce_detection=False,
         )
         return [
             (np.array(r["embedding"], dtype=np.float64), r["facial_area"])
             for r in results
+            if r.get("facial_area", {}).get("w", 0) > 30  # 过滤噪声检测
         ]
     except (ValueError, Exception):
         return []

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from cc_audio_engine import AudioBridge
 from cc_audio_out import AudioPlayer
+from pypinyin import lazy_pinyin
 from cc_tts_local import local_tts_to_pcm, preload as preload_tts
 from cc_stt_mlx import transcribe as mlx_transcribe, preload as preload_stt
 from cc_brain import think_stream
@@ -388,8 +389,8 @@ class JarvisV3:
             self.state = "IDLE"
             return
 
-        # 回声过滤
-        if self._is_echo(clean_text):
+        # 回声过滤（只检查刚播完的，不检查历史）
+        if (time.time() - self._last_play_time) < 5.0 and self._is_echo(clean_text):
             self.state = "IDLE"
             return
 
@@ -432,17 +433,51 @@ class JarvisV3:
     ]
     _last_wake_response = ""
 
+    @staticmethod
+    def _has_weisi(text: str) -> bool:
+        """拼音匹配：包含连续 'wei'+'si' 音就是唤醒词"""
+        py = lazy_pinyin(text)
+        for i in range(len(py) - 1):
+            if py[i] == 'wei' and py[i + 1] == 'si':
+                return True
+        # 英文 jarvis 兜底
+        if 'jarvis' in text.lower():
+            return True
+        return False
+
     def _check_wake(self, text: str) -> tuple:
         import random
         text_lower = text.lower()
 
-        # 文本匹配
+        # 拼音匹配（覆盖所有"X维斯"变体）
+        if self._has_weisi(text):
+            # 去掉唤醒词部分，提取指令
+            py = lazy_pinyin(text)
+            # 找到 wei+si 的位置，取后面的文字
+            for i in range(len(py) - 1):
+                if py[i] == 'wei' and py[i + 1] == 'si':
+                    # 唤醒词结束位置大约在原文的 i+2 个字
+                    wake_end = min(i + 2, len(text))
+                    clean = text[wake_end:].strip("。？！，、；：. ")
+                    break
+            else:
+                clean = ""
+
+            self._last_wake_time = time.time()
+            if not clean:
+                available = [r for r in self._WAKE_RESPONSES if r != self._last_wake_response]
+                resp = random.choice(available)
+                self._last_wake_response = resp
+                self._speak_single(resp)
+                return False, ""
+            return True, clean
+
+        # 文本精确匹配兜底
         for w in WAKE_WORDS:
             if w in text_lower:
                 clean = text_lower.replace(w, "").strip("。？！，、；：. ")
                 self._last_wake_time = time.time()
                 if not clean:
-                    # 随机应答，避免重复
                     available = [r for r in self._WAKE_RESPONSES if r != self._last_wake_response]
                     resp = random.choice(available)
                     self._last_wake_response = resp
@@ -564,7 +599,7 @@ class JarvisV3:
                 break
 
             self._recent_tts.append(sentence)
-            if len(self._recent_tts) > 10:
+            if len(self._recent_tts) > 5:
                 self._recent_tts.pop(0)
 
             self.player.play(pcm, sr)
@@ -607,7 +642,7 @@ class JarvisV3:
     def _speak_single(self, text: str):
         """播放单句（唤醒回复等）"""
         self._recent_tts.append(text)
-        if len(self._recent_tts) > 10:
+        if len(self._recent_tts) > 5:
             self._recent_tts.pop(0)
         try:
             with self._mlx_lock:

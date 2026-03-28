@@ -71,7 +71,7 @@ CLOUD_DEEP = "minimax"
 # 本地模型
 # 本地 LLM：oMLX Qwen3.5-9B（OpenAI 兼容接口）
 LOCAL_LLM_API = "http://localhost:8000/v1/chat/completions"
-LOCAL_LLM_MODEL = "Qwen3.5-4B-MLX-4bit"
+LOCAL_LLM_MODEL = "Qwen3.5-9B-4bit"
 
 # Ollama 降级（oMLX 不可用时）
 OLLAMA_CHAT_API = "http://localhost:11434/api/chat"
