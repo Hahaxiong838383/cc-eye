@@ -22,6 +22,7 @@ from pathlib import Path
 
 from cc_audio_engine import AudioBridge
 from cc_audio_out import AudioPlayer
+from cc_vision_mlx import VisionEngine
 from pypinyin import lazy_pinyin
 from cc_tts_local import local_tts_to_pcm, preload as preload_tts
 from cc_stt_mlx import transcribe as mlx_transcribe, preload as preload_stt
@@ -103,6 +104,9 @@ class JarvisV3:
         # MLX 锁
         self._mlx_lock = threading.Lock()
 
+        # 视觉引擎（共用 MLX 锁，避免 GPU 冲突）
+        self.vision = VisionEngine(self._mlx_lock)
+
         # 停止
         self._stop = threading.Event()
 
@@ -149,6 +153,9 @@ class JarvisV3:
         # 4. 处理线程
         threading.Thread(target=self._process_loop, daemon=True).start()
 
+        # 启动视觉监控（后台，不阻塞）
+        self.vision.start()
+
         logger.info("就绪，说「贾维斯」唤醒")
         self._greet()
 
@@ -158,6 +165,7 @@ class JarvisV3:
         except KeyboardInterrupt:
             print("\n贾维斯下线")
         finally:
+            self.vision.stop()
             self.player.stop()
             self.bridge.stop()
 
