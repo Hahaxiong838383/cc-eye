@@ -447,44 +447,40 @@ def _execute_music(tool_name: str, content: str) -> ToolResult:
         return ToolResult(True, f"找到了：{'，'.join(results)}。要播放哪首？")
 
     elif tool_name == "music_stop":
-        _run_ncm(["stop"])
-        return ToolResult(True, "已停止播放。")
+        # orpheus 模式不支持 stop，用 pause 替代
+        _run_ncm_bg(["pause"])
+        return ToolResult(True, "已暂停。")
 
     elif tool_name == "music_resume":
-        _run_ncm(["resume"])
+        _run_ncm_bg(["resume"])
         return ToolResult(True, "继续播放。")
 
     elif tool_name == "music_next":
-        result = _run_ncm(["next"])
-        if result.get("success"):
-            return ToolResult(True, "下一首。")
-        # 队列没有下一首，自动播推荐
-        return _execute_music("music_random", "")
+        _run_ncm_bg(["next"])
+        return ToolResult(True, "下一首。")
 
     elif tool_name == "music_prev":
-        _run_ncm(["prev"])
+        _run_ncm_bg(["prev"])
         return ToolResult(True, "上一首。")
 
     elif tool_name == "music_vol_up":
-        _run_ncm(["volume", "80"])
+        # orpheus 模式不支持 volume，用 AppleScript 控制系统音量
+        subprocess.run(
+            ["osascript", "-e", "set volume output volume (output volume of (get volume settings) + 15)"],
+            capture_output=True, timeout=3,
+        )
         return ToolResult(True, "音量调大了。")
 
     elif tool_name == "music_vol_down":
-        _run_ncm(["volume", "30"])
+        subprocess.run(
+            ["osascript", "-e", "set volume output volume (output volume of (get volume settings) - 15)"],
+            capture_output=True, timeout=3,
+        )
         return ToolResult(True, "音量调小了。")
 
     elif tool_name == "music_state":
-        data = _run_ncm(["state"])
-        if "error" in data:
-            return ToolResult(True, "当前没有在播放。")
-        state = data.get("data", data.get("state", {}))
-        status = state.get("status", "stopped")
-        if status == "playing":
-            title = state.get("title", "")
-            artist = state.get("artist", "")
-            if title:
-                return ToolResult(True, f"正在播放{artist}的{title}。")
-        return ToolResult(True, "当前没有在播放。")
+        # orpheus 模式不支持 state，直接告知
+        return ToolResult(True, "音乐正在播放中。")
 
     elif tool_name == "music_recommend":
         data = _run_ncm(["recommend", "daily", "--limit", "5",
