@@ -58,15 +58,15 @@ _gemini_api_key: Optional[str] = None
 _doubao_api_key: Optional[str] = None
 _gemini_proxy_config: Optional[dict] = None
 
-# Gemini 代理（云端快速路径，OpenAI 兼容格式）
+# Gemini 代理（云端快速路径，OpenAI 兼容格式，配置在 .env）
 GEMINI_PROXY_DEFAULTS = {
-    "base_url": "http://23.226.135.149:4000/v1",
+    "base_url": "",
     "model": "gemini-2.5-flash",
 }
 
-# GPT 代理（MiniMax 深度路径的备选，OpenAI 兼容格式，无需 API Key）
+# GPT 代理（深度路径备选，OpenAI 兼容格式，配置在 .env）
 GPT_PROXY_DEFAULTS = {
-    "base_url": "http://23.226.135.149:4001/v1",
+    "base_url": "",
     "model": "gpt-5.4",
 }
 
