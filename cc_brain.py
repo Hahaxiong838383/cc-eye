@@ -64,6 +64,12 @@ GEMINI_PROXY_DEFAULTS = {
     "model": "gemini-2.5-flash",
 }
 
+# GPT 代理（MiniMax 深度路径的备选，OpenAI 兼容格式，无需 API Key）
+GPT_PROXY_DEFAULTS = {
+    "base_url": "http://23.226.135.149:4001/v1",
+    "model": "gpt-5.4",
+}
+
 # 豆包（备用快速路径）
 DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
 DOUBAO_MODEL = "doubao-seed-2.0-lite"
@@ -183,6 +189,32 @@ def _load_gemini_proxy_config() -> dict:
         pass
     _gemini_proxy_config = config
     return config
+
+
+def _load_gpt_proxy_config() -> dict:
+    """从 .env 加载 GPT 代理配置"""
+    config = dict(GPT_PROXY_DEFAULTS)
+    try:
+        if _ENV_FILE.exists():
+            for line in _ENV_FILE.read_text().splitlines():
+                if line.startswith("GPT_PROXY_BASE_URL="):
+                    config["base_url"] = line.split("=", 1)[1].strip()
+                elif line.startswith("GPT_PROXY_MODEL="):
+                    config["model"] = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return config
+
+
+_gpt_proxy_session = None
+
+def _get_gpt_proxy_session():
+    """GPT 代理走直连"""
+    global _gpt_proxy_session
+    if _gpt_proxy_session is None:
+        _gpt_proxy_session = requests.Session()
+        _gpt_proxy_session.trust_env = False
+    return _gpt_proxy_session
 
 
 def _get_gemini_proxy_session():
@@ -675,6 +707,83 @@ def _stream_gemini_proxy(user_text: str) -> Generator[str, None, None]:
         print(f"[cc-brain] Gemini 代理错误: {e}")
 
 
+def _stream_gpt_proxy(user_text: str) -> Generator[str, None, None]:
+    """GPT 5.4 代理流式（MiniMax 深度路径备选，OpenAI 兼容，无需 API Key）"""
+    config = _load_gpt_proxy_config()
+
+    system_prompt = _build_context()
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in _history[-MAX_HISTORY:]:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["text"]})
+    messages.append({"role": "user", "content": user_text})
+
+    url = config["base_url"].rstrip("/") + "/chat/completions"
+
+    try:
+        start = time.time()
+        resp = _get_gpt_proxy_session().post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": config["model"],
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 4096,
+                "stream": True,
+            },
+            timeout=20,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            print(f"[cc-brain] GPT 代理错误: {resp.status_code} {resp.text[:200]}")
+            return
+
+        full_text = ""
+        sentence_buf = ""
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                token = json.loads(data_str)["choices"][0]["delta"].get("content", "")
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
+            if not token:
+                continue
+
+            full_text += token
+            for ch in token:
+                sentence_buf += ch
+                if ch in _SENTENCE_DELIMITERS:
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+
+        if sentence_buf.strip():
+            yield sentence_buf.strip()
+
+        elapsed = time.time() - start
+        _history.append({"role": "user", "text": user_text})
+        _history.append({"role": "model", "text": full_text})
+        print(f"[cc-brain] GPT 代理 ({elapsed:.1f}s): {full_text[:60]}")
+
+    except Exception as e:
+        print(f"[cc-brain] GPT 代理错误: {e}")
+
+
 def _stream_doubao(user_text: str) -> Generator[str, None, None]:
     """豆包 doubao-seed-2.0-lite 流式（~300ms 首 token）"""
     api_key = _load_doubao_key()
@@ -1113,11 +1222,31 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
 
     if need_cloud:
         def _cloud():
+            """云端降级链：Gemini → GPT → MiniMax"""
             try:
+                got_any = False
+                # 优先 Gemini
                 for s in _stream_gemini_proxy(user_text):
                     cloud_q.put(("cloud", s))
-            except Exception:
-                pass
+                    got_any = True
+                if got_any:
+                    return
+            except Exception as e:
+                print(f"[cc-brain] Gemini 失败: {e}，尝试 GPT")
+            try:
+                got_any = False
+                for s in _stream_gpt_proxy(user_text):
+                    cloud_q.put(("cloud", s))
+                    got_any = True
+                if got_any:
+                    return
+            except Exception as e:
+                print(f"[cc-brain] GPT 失败: {e}，尝试 MiniMax")
+            try:
+                for s in _stream_minimax_model(user_text, MINIMAX_DEEP):
+                    cloud_q.put(("cloud", s))
+            except Exception as e:
+                print(f"[cc-brain] MiniMax 也失败: {e}")
             finally:
                 cloud_done.set()
         threading.Thread(target=_cloud, daemon=True).start()
