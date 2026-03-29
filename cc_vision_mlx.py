@@ -40,17 +40,16 @@ class VisionEngine:
         self._detail_processor = None
         self._camera: Optional[cv2.VideoCapture] = None
         self._running = False
-        self._paused = False  # 对话时暂停视觉扫描，释放 MLX 锁
         self._last_scene = ""
         self._last_detail = ""
 
     def pause(self):
-        """暂停视觉扫描（对话时调用，释放 MLX 锁给 TTS/LLM）"""
-        self._paused = True
+        """保留接口兼容（TTS 已拆到独立进程，不再需要暂停）"""
+        pass
 
     def resume(self):
-        """恢复视觉扫描（对话结束后调用）"""
-        self._paused = False
+        """保留接口兼容"""
+        pass
 
     def start(self):
         """启动视觉监控"""
@@ -176,11 +175,6 @@ class VisionEngine:
 
         while self._running:
             now = time.time()
-
-            # 对话中暂停扫描，释放 MLX 锁
-            if self._paused:
-                time.sleep(0.5)
-                continue
 
             # 快扫（每 10 秒）
             if now - last_fast >= FAST_INTERVAL:

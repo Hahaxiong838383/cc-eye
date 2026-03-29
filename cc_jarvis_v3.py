@@ -14,6 +14,7 @@ cc_jarvis_v3.py — 贾维斯 V3 全双工语音交互
 import logging
 import numpy as np
 import soundfile as sf
+import sys
 import threading
 import time
 import queue
@@ -124,6 +125,42 @@ class JarvisV3:
             logger.info(f"[state] {old} → {v}")
 
     # ════════════════════════════════════════
+    #  TTS 服务进程管理
+    # ════════════════════════════════════════
+
+    def _start_tts_server(self):
+        """启动 TTS 服务子进程（独立 Metal GPU 上下文）"""
+        import subprocess
+        self._tts_proc = subprocess.Popen(
+            [sys.executable, "cc_tts_server.py"],
+            cwd=str(Path(__file__).parent),
+        )
+        # 等待 UDS 就绪
+        sock_path = Path("/tmp/cc-tts.sock")
+        for _ in range(60):  # 最多等 30 秒（模型加载 + 预缓存）
+            if sock_path.exists():
+                try:
+                    from cc_tts_local import _send_recv
+                    resp = _send_recv({"action": "health"})
+                    if resp.get("ok"):
+                        logger.info(f"TTS 服务就绪 (PID {self._tts_proc.pid})")
+                        return
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        logger.warning("TTS 服务启动超时，将使用降级模式")
+
+    def _stop_tts_server(self):
+        """关闭 TTS 服务子进程"""
+        if hasattr(self, '_tts_proc') and self._tts_proc:
+            try:
+                self._tts_proc.terminate()
+                self._tts_proc.wait(timeout=5)
+                logger.info("TTS 服务已关闭")
+            except Exception:
+                self._tts_proc.kill()
+
+    # ════════════════════════════════════════
     #  启动
     # ════════════════════════════════════════
 
@@ -136,7 +173,10 @@ class JarvisV3:
         print("  Ctrl+C 退出")
         print("=" * 50)
 
-        # 1. 加载模型（顺序，避免 MLX 冲突）
+        # 1. 启动 TTS 服务进程（独立 Metal GPU 上下文）
+        self._start_tts_server()
+
+        # 2. 加载缓存 + STT 模型
         print("  加载模型...")
         preload_tts()
         preload_stt()
@@ -168,6 +208,7 @@ class JarvisV3:
             self.vision.stop()
             self.player.stop()
             self.bridge.stop()
+            self._stop_tts_server()
 
     def _greet(self):
         hour = datetime.now().hour
@@ -548,7 +589,6 @@ class JarvisV3:
     def _respond(self, text: str):
         self._responding = True
         self.state = "SPEAKING"
-        self.vision.pause()  # 对话时暂停视觉扫描，释放 MLX 锁
 
         synth_queue = queue.Queue()
 
@@ -565,10 +605,9 @@ class JarvisV3:
                     phrase = self._pick_transition(text)
                     logger.info(f"[过渡] {phrase}")
                     t0 = time.time()
-                    with self._mlx_lock:
-                        if not self._responding:
-                            break
-                        pcm, sr = local_tts_to_pcm(phrase)
+                    if not self._responding:
+                        break
+                    pcm, sr = local_tts_to_pcm(phrase)
                     logger.info(f"[TTS] {(time.time()-t0)*1000:.0f}ms | {phrase}")
                     synth_queue.put((pcm, sr, phrase))
                     continue
@@ -584,10 +623,9 @@ class JarvisV3:
                     break  # 合成前再检查一次
                 logger.info(f"[回复] {sentence}")
                 t0 = time.time()
-                with self._mlx_lock:
-                    if not self._responding:
-                        break  # 锁等待期间可能被打断
-                    pcm, sr = local_tts_to_pcm(sentence)
+                if not self._responding:
+                    break
+                pcm, sr = local_tts_to_pcm(sentence)
                 logger.info(f"[TTS] {(time.time()-t0)*1000:.0f}ms | {len(pcm)/sr:.1f}s")
                 synth_queue.put((pcm, sr, sentence))
             synth_queue.put(None)
@@ -622,7 +660,6 @@ class JarvisV3:
             self._last_play_time = time.time()
 
         self._responding = False
-        self.vision.resume()  # 对话结束，恢复视觉扫描
         self._reset_vad()
         time.sleep(0.15)
         self.state = "IDLE"
@@ -654,8 +691,7 @@ class JarvisV3:
         if len(self._recent_tts) > 5:
             self._recent_tts.pop(0)
         try:
-            with self._mlx_lock:
-                pcm, sr = local_tts_to_pcm(text)
+            pcm, sr = local_tts_to_pcm(text)
         except Exception as e:
             logger.error(f"TTS: {e}")
             return
