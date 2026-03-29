@@ -184,6 +184,7 @@ _TOOL_PATTERNS: list[tuple[str, str, int]] = [
     (r"(?:播放|放|听)?(?:每日|今日|今天的?)?推荐(?:的?歌曲?|的?音乐|的?歌)?", "music_random", 0),
     # 无具体歌名的通用请求 → 随机/推荐
     (r"(?:播放|放|听|来点|播点|放点|来一?首|点一?首|放一?首|播一?首)(?:歌曲?|音乐|的?歌|的?音乐)$", "music_random", 0),
+    (r"(?:随便|随机)(?:播播|放放|听听|来点|放点)", "music_random", 0),
     # 有具体歌名/歌手 → 搜索播放
     (r"(?:播放|放|听|来一?首|点一?首|播一?首)(?:一下)?(?:一首)?(.+?)(?:的歌|的音乐)?$", "music_play", 1),
     (r"(?:搜|搜索|找|查)(?:一下)?(.+?)(?:的歌|的音乐|歌曲)$", "music_search", 1),
@@ -211,7 +212,8 @@ _TOOL_PATTERNS: list[tuple[str, str, int]] = [
 # 音乐相关关键词（正则没匹配到但可能是音乐请求）
 _MUSIC_HINTS = {"歌", "音乐", "曲", "嗨", "安静", "轻松", "助眠", "提神",
                 "氛围", "伤感", "开心", "工作", "加班", "跑步", "运动",
-                "古典", "爵士", "摇滚", "民谣", "电子", "嘻哈", "说唱"}
+                "古典", "爵士", "摇滚", "民谣", "电子", "嘻哈", "说唱",
+                "播播", "放放", "听听"}
 
 
 def detect_tool_intent(text: str) -> Optional[Tuple[str, str]]:
@@ -329,7 +331,7 @@ def _find_playable(records: list) -> list:
 
 
 def _play_song(song: dict) -> bool:
-    """播放单曲，返回是否成功"""
+    """播放单曲，返回是否成功。播放后自动隐藏网易云 App 窗口。"""
     enc_id = str(song.get("id", ""))
     orig_id = str(song.get("originalId", ""))
     if not enc_id or not orig_id:
@@ -339,6 +341,20 @@ def _play_song(song: dict) -> bool:
         "--encrypted-id", enc_id,
         "--original-id", orig_id,
     ])
+    # 延迟隐藏网易云 App 窗口（后台播放）
+    import threading
+    def _hide_app():
+        import time as _t
+        _t.sleep(2)
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to set visible of process "NeteaseMusic" to false'],
+                capture_output=True, timeout=3,
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_hide_app, daemon=True).start()
     return True
 
 
