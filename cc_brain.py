@@ -955,13 +955,13 @@ def _stream_gemini(user_text: str) -> Generator[str, None, None]:
         print(f"[cc-brain] Gemini 错误: {e}")
 
 
-def _stream_minimax_model(user_text: str, model: str) -> Generator[str, None, None]:
+def _stream_minimax_model(user_text: str, model: str, mode: str = "fast") -> Generator[str, None, None]:
     """用指定模型流式调用 MiniMax"""
     api_key = _load_minimax_key()
     if not api_key:
         return
 
-    system_prompt = _build_context()
+    system_prompt = _build_context(mode)
     messages = [{"role": "system", "content": system_prompt}]
     for msg in _history[-MAX_HISTORY:]:
         role = "user" if msg["role"] == "user" else "assistant"
@@ -1249,31 +1249,72 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     if need_cloud:
         deep = _needs_deep_think(user_text)
 
-        def _cloud():
-            """云端路由：简单→Gemini(快速) / 复杂→GPT(深度)，各自降级到 MiniMax"""
-            primary = _stream_gpt_proxy if deep else _stream_gemini_proxy
-            label = "GPT" if deep else "Gemini"
-            try:
-                got_any = False
-                for s in primary(user_text):
-                    cloud_q.put(("cloud", s))
-                    got_any = True
-                if got_any:
-                    return
-            except Exception as e:
-                print(f"[cc-brain] {label} 失败: {e}，降级 MiniMax")
-            # 降级 MiniMax
-            try:
-                for s in _stream_minimax_model(user_text, MINIMAX_DEEP):
-                    cloud_q.put(("cloud", s))
-            except Exception as e:
-                print(f"[cc-brain] MiniMax 也失败: {e}")
-            finally:
-                cloud_done.set()
+        if not deep:
+            # 简单问题：Gemini 快速回答，失败降级 MiniMax
+            def _cloud():
+                try:
+                    got_any = False
+                    for s in _stream_gemini_proxy(user_text):
+                        cloud_q.put(("cloud", s))
+                        got_any = True
+                    if got_any:
+                        return
+                except Exception as e:
+                    print(f"[cc-brain] Gemini 失败: {e}，降级 MiniMax")
+                try:
+                    for s in _stream_minimax_model(user_text, MINIMAX_DEEP):
+                        cloud_q.put(("cloud", s))
+                except Exception as e:
+                    print(f"[cc-brain] MiniMax 也失败: {e}")
+                finally:
+                    cloud_done.set()
+            threading.Thread(target=_cloud, daemon=True).start()
+        else:
+            # 深度问题：GPT + MiniMax 并行竞速，谁先出首句谁接管
+            print(f"[cc-brain] 深度思考模式 → GPT + MiniMax 竞速")
+            _race_q = queue.Queue()  # (source_label, sentence)
+            _race_winner = [None]    # 第一个出句子的模型
 
-        if deep:
-            print(f"[cc-brain] 深度思考模式 → GPT 5.4")
-        threading.Thread(target=_cloud, daemon=True).start()
+            def _race_gpt():
+                try:
+                    for s in _stream_gpt_proxy(user_text):
+                        _race_q.put(("gpt", s))
+                except Exception as e:
+                    print(f"[cc-brain] GPT 竞速失败: {e}")
+                _race_q.put(("gpt", None))  # 结束标记
+
+            def _race_minimax():
+                try:
+                    for s in _stream_minimax_model(user_text, MINIMAX_DEEP, mode="deep"):
+                        _race_q.put(("minimax", s))
+                except Exception as e:
+                    print(f"[cc-brain] MiniMax 竞速失败: {e}")
+                _race_q.put(("minimax", None))  # 结束标记
+
+            threading.Thread(target=_race_gpt, daemon=True).start()
+            threading.Thread(target=_race_minimax, daemon=True).start()
+
+            def _cloud():
+                """从竞速队列取句子，只用第一个出结果的模型"""
+                finished_count = 0
+                try:
+                    while finished_count < 2:
+                        src, sentence = _race_q.get(timeout=0.3)
+                        if sentence is None:
+                            finished_count += 1
+                            continue
+                        # 第一个出句子的模型成为 winner
+                        if _race_winner[0] is None:
+                            _race_winner[0] = src
+                            print(f"[cc-brain] 深度竞速胜出: {src}")
+                        # 只接受 winner 的输出
+                        if src == _race_winner[0]:
+                            cloud_q.put(("cloud", sentence))
+                except queue.Empty:
+                    pass
+                finally:
+                    cloud_done.set()
+            threading.Thread(target=_cloud, daemon=True).start()
     else:
         cloud_done.set()
 
