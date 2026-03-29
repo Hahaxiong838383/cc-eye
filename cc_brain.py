@@ -254,20 +254,22 @@ def _build_context(mode: str = "fast") -> str:
     system += "\n\n[语音场景]\n你正在通过扬声器与川哥实时语音对话。"
 
     if mode == "deep_intro":
-        # Gemini 快速衔接：先给 2-3 句概述，让用户知道你在处理
+        # Gemini 快速概述：2-3 句点明方向，为后续深入做铺垫
         system += (
             "\n川哥问了一个需要深入分析的问题。"
-            "\n你先给 2-3 句快速概述：点明核心要点和你的初步判断。"
-            "\n语气自然，像朋友先快速回应，后面会继续展开。"
-            "\n不要说'让我想想'或'我来查一下'，直接给初步判断。"
+            "\n你先给 2-3 句话快速回应：点明这个问题的核心和你的初步判断。"
+            "\n语气自然从容，像朋友先快速接话。"
+            "\n不要说'让我想想'、'我来查一下'，直接给有价值的判断。"
+            "\n结尾可以自然过渡到后续深入，比如'具体来说'、'展开看'。"
         )
     elif mode == "deep_detail":
-        # GPT 深度展开：接着概述继续说，不重复概述的内容
+        # MiniMax 深度展开：接着概述继续讲，不重复
         system += (
-            "\n你刚才已经给了一个快速概述，现在深入展开分析。"
-            "\n不要重复开头的概述，直接进入细节和深度内容。"
-            "\n分段说，每段 2-3 句。有不同角度时分析利弊。"
-            "\n可以稍长，但要有条理，像是同一个人在继续深入讲。"
+            "\n你正在对一个问题做深入分析，前面已经给了快速概述。"
+            "\n现在直接进入深度内容，不要重复概述，不要重新开头。"
+            "\n用'具体来说'、'第一个方面'、'另外'等衔接词自然接上。"
+            "\n分段说，每段 2-3 句，有条理有深度。"
+            "\n像是同一个人从概述自然过渡到深入讲解。"
         )
     else:
         system += (
@@ -964,13 +966,15 @@ def _stream_gemini(user_text: str) -> Generator[str, None, None]:
         print(f"[cc-brain] Gemini 错误: {e}")
 
 
-def _stream_minimax_model(user_text: str, model: str, mode: str = "fast") -> Generator[str, None, None]:
-    """用指定模型流式调用 MiniMax"""
+def _stream_minimax_model(user_text: str, model: str, mode: str = "fast", prev_text: str = "") -> Generator[str, None, None]:
+    """用指定模型流式调用 MiniMax。prev_text: 前一阶段的输出（用于衔接）"""
     api_key = _load_minimax_key()
     if not api_key:
         return
 
     system_prompt = _build_context(mode)
+    if prev_text and mode == "deep_detail":
+        system_prompt += f"\n\n[你刚才说的] {prev_text}\n接着上面的内容继续深入，不要重复。"
     messages = [{"role": "system", "content": system_prompt}]
     for msg in _history[-MAX_HISTORY:]:
         role = "user" if msg["role"] == "user" else "assistant"
@@ -1295,9 +1299,9 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
                 if gemini_text:
                     print(f"[cc-brain] Gemini 概述完成: {gemini_text[:40]}...")
 
-                # 阶段2：MiniMax 深度展开
+                # 阶段2：MiniMax 深度展开（传入 Gemini 的概述，避免重复）
                 try:
-                    for s in _stream_minimax_model(user_text, MINIMAX_DEEP, mode="deep_detail"):
+                    for s in _stream_minimax_model(user_text, MINIMAX_DEEP, mode="deep_detail", prev_text=gemini_text):
                         cloud_q.put(("cloud", s))
                 except Exception as e:
                     print(f"[cc-brain] MiniMax 展开失败: {e}")
