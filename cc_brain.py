@@ -744,7 +744,7 @@ def _stream_gpt_proxy(user_text: str) -> Generator[str, None, None]:
                 "max_tokens": 4096,
                 "stream": True,
             },
-            timeout=20,
+            timeout=60,  # GPT 深度思考需要更长时间
             stream=True,
         )
         if resp.status_code != 200:

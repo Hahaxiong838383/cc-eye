@@ -11,6 +11,9 @@ cc_jarvis_v3.py — 贾维斯 V3 全双工语音交互
   → Qwen3-TTS MLX → 常驻 OutputStream（零 click，可打断）
 """
 
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"  # 禁止 HuggingFace 模型版本检查，所有模型已在本地
+
 import logging
 import numpy as np
 import soundfile as sf
