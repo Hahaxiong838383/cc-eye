@@ -35,12 +35,19 @@ def _get_model():
     from mlx_audio.stt.utils import load_model
     print("[cc-stt] 加载 Qwen3-ASR MLX...")
     _model = load_model(_MODEL_ID)
-    # 预热
-    import tempfile, numpy as np, soundfile as sf
+    # 预热：用带噪声的音频触发完整 Metal shader 编译
+    import tempfile, numpy as np, soundfile as sf, time as _t
+    _t0 = _t.time()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-        sf.write(f.name, np.zeros(16000, dtype=np.float32), 16000)
+        # 生成 1 秒白噪声（不用静音，确保走完整推理路径）
+        noise = (np.random.randn(16000) * 0.01).astype(np.float32)
+        sf.write(f.name, noise, 16000)
         _model.generate(f.name)
-    print("[cc-stt] Qwen3-ASR 就绪 (~130ms/句)")
+    # 再跑一次确保 shader 完全缓存
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+        sf.write(f.name, noise, 16000)
+        _model.generate(f.name)
+    print(f"[cc-stt] Qwen3-ASR 就绪（预热 {(_t.time()-_t0)*1000:.0f}ms）")
     return _model
 
 
