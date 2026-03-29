@@ -20,7 +20,7 @@ from pathlib import Path
 
 from cc_context import build_system_prompt, get_scene_context
 from cc_events import get_context_window, post_event
-from cc_tools import try_tool
+from cc_tools import detect_tool_intent, execute_tool
 
 # ── 交互日志（自学习数据采集）──
 _INTERACTION_LOG = Path("/tmp/cc-eye-interactions.jsonl")
@@ -225,7 +225,7 @@ def _build_context() -> str:
         "\n川哥问你看到什么时，用自然的话描述画面，不要照搬场景描述原文。"
         "\n结合视觉场景和对话上下文回答，像一个能看到对方的朋友。"
         "\n问实时信息时直接搜索回答，不说'我没有联网'。"
-        "\n你能播放音乐（网易云音乐），川哥说播歌/听歌/放音乐时，系统会自动处理。"
+        "\n你能播放音乐（网易云音乐）。川哥说播歌/听歌/放音乐时系统自动处理，你不需要操心。"
         "\n不要输出思考过程，不要使用<think>标签，直接回答。"
     )
     return system
@@ -1063,11 +1063,25 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
         return
 
     # ── 工具调用检测（优先于 LLM）──
-    tool_result = try_tool(user_text)
-    if tool_result:
-        yield tool_result
-        _log_interaction(user_text, "tool", tool_result, "", time.time() - start_time)
-        post_event("response", f"工具调用: {tool_result[:30]}", source="brain")
+    intent = detect_tool_intent(user_text)
+    if intent:
+        tool_name, content = intent
+        # music_smart: 先播过渡语，再等 Gemini
+        if tool_name == "music_smart":
+            yield "__TRANSITION__"
+            result = execute_tool(tool_name, content)
+            yield result.message
+            _log_interaction(user_text, "tool_smart", result.message, "", time.time() - start_time)
+            post_event("response", f"智能音乐: {result.message[:30]}", source="brain")
+            return
+        # 其他工具：直接执行
+        result = execute_tool(tool_name, content)
+        print(f"[cc-tools] 意图识别: {tool_name} → {content[:50]}")
+        status = "ok" if result.success else "fail"
+        print(f"[cc-tools] 执行结果: [{status}] {result.message}")
+        yield result.message
+        _log_interaction(user_text, "tool", result.message, "", time.time() - start_time)
+        post_event("response", f"工具调用: {result.message[:30]}", source="brain")
         return
 
     # ── 统一路由：预缓存(0ms) → 9B(300ms) → 云端补充 ──

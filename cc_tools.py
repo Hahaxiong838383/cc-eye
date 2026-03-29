@@ -177,14 +177,17 @@ class FeishuClient:
 _TOOL_PATTERNS: list[tuple[str, str, int]] = [
     # (regex_pattern, tool_name, content_group_index)
     # 音乐播放（优先匹配，避免被飞书模式吞掉）
-    # 查询当前播放状态（放最前面，避免被 play 吞掉）
+    # 查询当前播放状态（放最前面）
     (r"(?:现在|正在)?(?:放|播)(?:的)?(?:什么|啥)(?:歌|音乐|曲)?", "music_state", 0),
     (r"(?:这是|这首)(?:什么|啥)(?:歌|音乐|曲)", "music_state", 0),
+    # 推荐/每日推荐（在 play 前面，避免"播放推荐"被 play 吞掉）
+    (r"(?:播放|放|听)?(?:每日|今日|今天的?)?推荐(?:的?歌曲?|的?音乐|的?歌)?", "music_random", 0),
     # 无具体歌名的通用请求 → 随机/推荐
-    (r"(?:播放|放|听|来点|播点|放点|来一?首|点一?首|放一?首|播一?首)(?:歌曲?|音乐|歌)$", "music_random", 0),
+    (r"(?:播放|放|听|来点|播点|放点|来一?首|点一?首|放一?首|播一?首)(?:歌曲?|音乐|的?歌|的?音乐)$", "music_random", 0),
     # 有具体歌名/歌手 → 搜索播放
     (r"(?:播放|放|听|来一?首|点一?首|播一?首)(?:一下)?(?:一首)?(.+?)(?:的歌|的音乐)?$", "music_play", 1),
-    (r"(?:搜|搜索|找|查)(?:一下)?(.+?)(?:的歌|的音乐|歌曲?)?$", "music_search", 1),
+    (r"(?:搜|搜索|找|查)(?:一下)?(.+?)(?:的歌|的音乐|歌曲)$", "music_search", 1),
+    (r"(?:搜|搜索|找)(?:一下)?(?:歌曲?|音乐|歌手)(.+)$", "music_search", 1),
     (r"(?:暂停|停止|停一下|别播了|关掉|停)(?:音乐|歌曲?|歌|播放)?", "music_stop", 0),
     (r"(?:继续|继续播|接着放|接着播|恢复播放)(?:音乐|歌曲?|歌)?", "music_resume", 0),
     (r"(?:下一首|切歌|换一首|跳过|下一曲)", "music_next", 0),
@@ -192,7 +195,6 @@ _TOOL_PATTERNS: list[tuple[str, str, int]] = [
     (r"(?:声音|音量)(?:大一?点|调大|加大|提高)", "music_vol_up", 0),
     (r"(?:声音|音量)(?:小一?点|调小|减小|降低)", "music_vol_down", 0),
     (r"(?:每日|今日)?推荐(?:歌曲?|音乐|歌)?", "music_recommend", 0),
-    (r"(?:现在|正在)?(?:放|播)(?:的)?(?:什么|啥)(?:歌|音乐|曲)?", "music_state", 0),
     # 注意：安静/闭嘴等由 cc_jarvis_v3.py 的 QUIET_WORDS 直接处理，不走工具
     # 发消息（长匹配在前）
     (r"(?:发一条|发送|发个|发)(?:飞书|群里?)?(?:通知|消息)[：:，,\s]*(.+)", "feishu_send", 1),
@@ -204,6 +206,12 @@ _TOOL_PATTERNS: list[tuple[str, str, int]] = [
     (r"(?:飞书|群里?)(?:有什么|最近|新)?(?:消息|通知|动态)", "feishu_read", 0),
     (r"(?:看看|查看|读)(?:飞书|群里?)?(?:消息|通知|动态)", "feishu_read", 0),
 ]
+
+
+# 音乐相关关键词（正则没匹配到但可能是音乐请求）
+_MUSIC_HINTS = {"歌", "音乐", "曲", "嗨", "安静", "轻松", "助眠", "提神",
+                "氛围", "伤感", "开心", "工作", "加班", "跑步", "运动",
+                "古典", "爵士", "摇滚", "民谣", "电子", "嘻哈", "说唱"}
 
 
 def detect_tool_intent(text: str) -> Optional[Tuple[str, str]]:
@@ -222,6 +230,11 @@ def detect_tool_intent(text: str) -> Optional[Tuple[str, str]]:
             if tool_name == "feishu_send" and len(content) < 2:
                 continue
             return (tool_name, content)
+
+    # 兜底：正则没匹配到，但包含音乐关键词 → Gemini 智能调度
+    if any(h in text for h in _MUSIC_HINTS):
+        return ("music_smart", text)
+
     return None
 
 
@@ -239,7 +252,11 @@ def _get_feishu() -> FeishuClient:
 
 def execute_tool(tool_name: str, content: str) -> ToolResult:
     """执行工具调用，返回 TTS 播报文本"""
-    # 音乐工具
+    # 音乐智能调度（Gemini）
+    if tool_name == "music_smart":
+        return _execute_music_smart(content)
+
+    # 音乐工具（正则直接执行）
     if tool_name.startswith("music_"):
         return _execute_music(tool_name, content)
 
@@ -353,8 +370,9 @@ def _execute_music(tool_name: str, content: str) -> ToolResult:
         # 后续可播放的歌加到队列
         for s in playable[1:4]:
             enc = str(s.get("id", ""))
-            if enc:
-                _run_ncm_bg(["queue", "add", "--encrypted-id", enc])
+            orig = str(s.get("originalId", ""))
+            if enc and orig:
+                _run_ncm_bg(["queue", "add", "--encrypted-id", enc, "--original-id", orig])
 
         return ToolResult(True, f"正在播放{artist}的{song_name}。")
 
@@ -374,8 +392,9 @@ def _execute_music(tool_name: str, content: str) -> ToolResult:
 
         for s in playable[1:5]:
             enc = str(s.get("id", ""))
-            if enc:
-                _run_ncm_bg(["queue", "add", "--encrypted-id", enc])
+            orig = str(s.get("originalId", ""))
+            if enc and orig:
+                _run_ncm_bg(["queue", "add", "--encrypted-id", enc, "--original-id", orig])
 
         return ToolResult(True, f"给你放一首{artist}的{song_name}。")
 
@@ -409,8 +428,11 @@ def _execute_music(tool_name: str, content: str) -> ToolResult:
         return ToolResult(True, "继续播放。")
 
     elif tool_name == "music_next":
-        _run_ncm(["next"])
-        return ToolResult(True, "下一首。")
+        result = _run_ncm(["next"])
+        if result.get("success"):
+            return ToolResult(True, "下一首。")
+        # 队列没有下一首，自动播推荐
+        return _execute_music("music_random", "")
 
     elif tool_name == "music_prev":
         _run_ncm(["prev"])
@@ -478,6 +500,113 @@ def try_tool(user_text: str) -> Optional[str]:
     print(f"[cc-tools] 执行结果: [{status}] {result.message}")
 
     return result.message
+
+
+# ── Gemini 智能音乐调度 ──
+
+_MUSIC_SMART_PROMPT = """\
+你是音乐搜索助手。根据用户请求，输出一个 JSON，用于 ncm-cli 搜索。
+只输出 JSON，不要任何其他文字。
+
+规则：
+- keyword 是给网易云音乐搜索用的关键词，2-4个词，中文
+- 理解用户的情绪、场景、风格偏好，转化为搜索关键词
+- 如果用户提到具体歌手/歌名，直接用
+
+示例：
+用户：放点轻松的 → {"keyword": "轻音乐 放松 纯音乐"}
+用户：来个适合加班的 → {"keyword": "工作 专注 轻音乐"}
+用户：心情不好 → {"keyword": "治愈 温暖 民谣"}
+用户：嗨一点的 → {"keyword": "电子 嗨曲 节奏"}
+用户：古典音乐 → {"keyword": "古典 钢琴曲"}
+"""
+
+
+def _call_gemini_sync(prompt: str, user_text: str, timeout: int = 8) -> Optional[str]:
+    """同步调用 Gemini 代理（非流式），返回文本结果"""
+    from cc_brain import _load_gemini_proxy_config, _get_gemini_proxy_session
+    config = _load_gemini_proxy_config()
+    api_key = config.get("api_key")
+    if not api_key:
+        return None
+
+    url = config["base_url"].rstrip("/") + "/chat/completions"
+    try:
+        resp = _get_gemini_proxy_session().post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config["model"],
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 100,
+            },
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[cc-tools] Gemini 调用失败: {e}")
+    return None
+
+
+def _execute_music_smart(user_text: str) -> ToolResult:
+    """Gemini 智能音乐调度：理解模糊请求 → 生成搜索关键词 → 搜索播放"""
+    print(f"[cc-tools] 音乐智能调度: {user_text}")
+
+    # 1. 调 Gemini 获取搜索关键词
+    result = _call_gemini_sync(_MUSIC_SMART_PROMPT, user_text)
+    if not result:
+        return ToolResult(False, "网络不太好，你直接告诉我歌名吧。")
+
+    # 2. 解析 JSON
+    try:
+        # 清理可能的 markdown 代码块
+        clean = result.strip().strip("`").strip()
+        if clean.startswith("json"):
+            clean = clean[4:].strip()
+        data = json.loads(clean)
+        keyword = data.get("keyword", "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        # Gemini 返回的不是 JSON，直接当关键词用
+        keyword = result.strip()[:20]
+
+    if not keyword:
+        return ToolResult(False, "没理解你想听什么，换个说法试试？")
+
+    print(f"[cc-tools] Gemini → 关键词: {keyword}")
+
+    # 3. 搜索播放（复用 _execute_music 的 music_play 逻辑）
+    search_data = _run_ncm(["search", "song", "--keyword", keyword,
+                            "--userInput", f"智能推荐: {user_text}"])
+    if "error" in search_data:
+        return ToolResult(False, "搜索出了点问题。")
+
+    records = search_data.get("data", {}).get("records", [])
+    playable = _find_playable(records)
+    if not playable:
+        return ToolResult(False, f"没找到合适的歌，换个说法试试？")
+
+    song = playable[0]
+    song_name = song.get("name", "未知")
+    artist = song["artists"][0]["name"] if song.get("artists") else "未知"
+
+    _play_song(song)
+
+    # 后续加到队列
+    for s in playable[1:4]:
+        enc = str(s.get("id", ""))
+        orig = str(s.get("originalId", ""))
+        if enc and orig:
+            _run_ncm_bg(["queue", "add", "--encrypted-id", enc, "--original-id", orig])
+
+    return ToolResult(True, f"给你找了{artist}的{song_name}，听听看。")
 
 
 # ── 测试 ──

@@ -251,6 +251,10 @@ class JarvisV3:
                     self._last_wake_time = time.time()
                     self._oww.reset()
 
+        # 音乐播放时：带通滤波，只留人声频段（过滤背景音乐干扰）
+        if self._is_music_playing():
+            resampled = self._bandpass_voice(resampled)
+
         # 按帧处理 VAD
         for i in range(0, len(resampled) - VAD_WINDOW + 1, VAD_WINDOW):
             frame = resampled[i:i + VAD_WINDOW]
@@ -384,6 +388,32 @@ class JarvisV3:
         self._speech_ms = 0
         self._silence_ms = 0
 
+    _music_playing_cache: float = 0  # 缓存，避免每帧都 pgrep
+    _music_playing_val: bool = False
+
+    def _is_music_playing(self) -> bool:
+        """检测 mpv 是否在播放音乐（1秒缓存，避免频繁 pgrep）"""
+        now = time.time()
+        if now - self._music_playing_cache < 1.0:
+            return self._music_playing_val
+        self._music_playing_cache = now
+        import subprocess as _sp
+        try:
+            result = _sp.run(["pgrep", "-f", "mpv.*idle"], capture_output=True, timeout=0.5)
+            self._music_playing_val = result.returncode == 0
+        except Exception:
+            self._music_playing_val = False
+        return self._music_playing_val
+
+    @staticmethod
+    def _bandpass_voice(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
+        """带通滤波：只留人声频段 300Hz-3kHz，滤掉音乐的低频和高频"""
+        from scipy.signal import butter, sosfilt
+        low = 300 / (sr / 2)
+        high = 3000 / (sr / 2)
+        sos = butter(4, [low, high], btype='band', output='sos')
+        return sosfilt(sos, audio).astype(np.float32)
+
     # ════════════════════════════════════════
     #  处理循环
     # ════════════════════════════════════════
@@ -402,6 +432,10 @@ class JarvisV3:
 
     def _handle_segment(self, audio: np.ndarray):
         self.state = "PROCESSING"
+
+        # 音乐播放时：滤波后再送 STT（去除背景音乐干扰）
+        if self._is_music_playing():
+            audio = self._bandpass_voice(audio)
 
         # 能量门槛
         energy = float(np.abs(audio).mean())
