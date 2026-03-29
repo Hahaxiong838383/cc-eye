@@ -176,6 +176,24 @@ class FeishuClient:
 
 _TOOL_PATTERNS: list[tuple[str, str, int]] = [
     # (regex_pattern, tool_name, content_group_index)
+    # 音乐播放（优先匹配，避免被飞书模式吞掉）
+    # 查询当前播放状态（放最前面，避免被 play 吞掉）
+    (r"(?:现在|正在)?(?:放|播)(?:的)?(?:什么|啥)(?:歌|音乐|曲)?", "music_state", 0),
+    (r"(?:这是|这首)(?:什么|啥)(?:歌|音乐|曲)", "music_state", 0),
+    # 无具体歌名的通用请求 → 随机/推荐
+    (r"(?:播放|放|听|来点|播点|放点|来一?首|点一?首|放一?首|播一?首)(?:歌曲?|音乐|歌)$", "music_random", 0),
+    # 有具体歌名/歌手 → 搜索播放
+    (r"(?:播放|放|听|来一?首|点一?首|播一?首)(?:一下)?(?:一首)?(.+?)(?:的歌|的音乐)?$", "music_play", 1),
+    (r"(?:搜|搜索|找|查)(?:一下)?(.+?)(?:的歌|的音乐|歌曲?)?$", "music_search", 1),
+    (r"(?:暂停|停止|停一下|别播了|关掉|停)(?:音乐|歌曲?|歌|播放)?", "music_stop", 0),
+    (r"(?:继续|继续播|接着放|接着播|恢复播放)(?:音乐|歌曲?|歌)?", "music_resume", 0),
+    (r"(?:下一首|切歌|换一首|跳过|下一曲)", "music_next", 0),
+    (r"(?:上一首|上一曲|前一首)", "music_prev", 0),
+    (r"(?:声音|音量)(?:大一?点|调大|加大|提高)", "music_vol_up", 0),
+    (r"(?:声音|音量)(?:小一?点|调小|减小|降低)", "music_vol_down", 0),
+    (r"(?:每日|今日)?推荐(?:歌曲?|音乐|歌)?", "music_recommend", 0),
+    (r"(?:现在|正在)?(?:放|播)(?:的)?(?:什么|啥)(?:歌|音乐|曲)?", "music_state", 0),
+    # 注意：安静/闭嘴等由 cc_jarvis_v3.py 的 QUIET_WORDS 直接处理，不走工具
     # 发消息（长匹配在前）
     (r"(?:发一条|发送|发个|发)(?:飞书|群里?)?(?:通知|消息)[：:，,\s]*(.+)", "feishu_send", 1),
     (r"(?:发一条|发送|发个|发)(?:飞书|群里?)[：:，,\s]*(.+)", "feishu_send", 1),
@@ -221,14 +239,220 @@ def _get_feishu() -> FeishuClient:
 
 def execute_tool(tool_name: str, content: str) -> ToolResult:
     """执行工具调用，返回 TTS 播报文本"""
-    client = _get_feishu()
+    # 音乐工具
+    if tool_name.startswith("music_"):
+        return _execute_music(tool_name, content)
 
+    # 飞书工具
+    client = _get_feishu()
     if tool_name == "feishu_send":
         return client.send_message(content)
     elif tool_name == "feishu_read":
         return client.get_recent_messages()
 
     return ToolResult(False, f"这个功能还没实现。")
+
+
+# ── 音乐工具（ncm-cli 封装）──
+
+import subprocess
+
+
+def _ncm_env() -> dict:
+    """清除代理环境变量，确保直连"""
+    return {k: v for k, v in __import__("os").environ.items()
+            if not k.lower().startswith(("http_proxy", "https_proxy", "all_proxy", "socks"))}
+
+
+def _run_ncm_bg(args: list):
+    """后台执行 ncm-cli 命令（不等结果，用于播放等长时间运行的命令）"""
+    cmd = ["ncm-cli"] + args
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ncm_env())
+    except Exception as e:
+        print(f"[cc-tools] ncm-cli 后台启动失败: {e}")
+
+
+def _run_ncm(args: list, timeout: int = 15) -> dict:
+    """执行 ncm-cli 命令，返回 JSON 结果（直连，不走代理）"""
+    cmd = ["ncm-cli"] + args + ["--output", "json"]
+    env = _ncm_env()
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+        return {"error": result.stderr.strip() or "命令执行失败"}
+    except subprocess.TimeoutExpired:
+        return {"error": "命令超时"}
+    except json.JSONDecodeError:
+        return {"error": "解析结果失败"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _clean_keyword(content: str) -> str:
+    """清洗音乐搜索关键词"""
+    keyword = content.strip()
+    keyword = re.sub(r"[。，！？、\s]+", "", keyword)
+    keyword = re.sub(r"^(?:听|放|播放|来一?首|点一?首)(?:一下)?", "", keyword)
+    keyword = re.sub(r"(?:的歌曲?|的音乐|歌曲?|音乐)$", "", keyword)
+    return keyword.strip()
+
+
+def _find_playable(records: list) -> list:
+    """从搜索结果中过滤可播放的歌曲（visible != false）"""
+    playable = []
+    for s in records:
+        if s.get("visible") is False:
+            continue
+        playable.append(s)
+    return playable
+
+
+def _play_song(song: dict) -> bool:
+    """播放单曲，返回是否成功"""
+    enc_id = str(song.get("id", ""))
+    orig_id = str(song.get("originalId", ""))
+    if not enc_id or not orig_id:
+        return False
+    _run_ncm_bg([
+        "play", "--song",
+        "--encrypted-id", enc_id,
+        "--original-id", orig_id,
+    ])
+    return True
+
+
+def _execute_music(tool_name: str, content: str) -> ToolResult:
+    """执行音乐相关工具"""
+
+    if tool_name == "music_play":
+        keyword = _clean_keyword(content)
+        if not keyword:
+            return ToolResult(False, "你想听什么歌？告诉我歌名或歌手。")
+
+        # 按 skill 规范加 --userInput
+        data = _run_ncm(["search", "song", "--keyword", keyword,
+                         "--userInput", f"播放{keyword}"])
+        if "error" in data:
+            return ToolResult(False, f"搜索出了点问题。")
+
+        records = data.get("data", {}).get("records", [])
+        playable = _find_playable(records)
+        if not playable:
+            return ToolResult(False, f"没找到{keyword}可播放的歌。")
+
+        song = playable[0]
+        song_name = song.get("name", "未知")
+        artist = song["artists"][0]["name"] if song.get("artists") else "未知"
+
+        _play_song(song)
+
+        # 后续可播放的歌加到队列
+        for s in playable[1:4]:
+            enc = str(s.get("id", ""))
+            if enc:
+                _run_ncm_bg(["queue", "add", "--encrypted-id", enc])
+
+        return ToolResult(True, f"正在播放{artist}的{song_name}。")
+
+    elif tool_name == "music_random":
+        data = _run_ncm(["recommend", "daily", "--limit", "10",
+                         "--userInput", "随机播放推荐音乐"])
+        records = data.get("data", []) if isinstance(data.get("data"), list) else data.get("data", {}).get("records", [])
+        playable = _find_playable(records) if records else []
+
+        if not playable:
+            return ToolResult(False, "推荐没拿到，你告诉我想听什么吧。")
+
+        song = playable[0]
+        song_name = song.get("name", "未知")
+        artist = song["artists"][0]["name"] if song.get("artists") else "未知"
+        _play_song(song)
+
+        for s in playable[1:5]:
+            enc = str(s.get("id", ""))
+            if enc:
+                _run_ncm_bg(["queue", "add", "--encrypted-id", enc])
+
+        return ToolResult(True, f"给你放一首{artist}的{song_name}。")
+
+    elif tool_name == "music_search":
+        keyword = _clean_keyword(content)
+        if not keyword:
+            return ToolResult(False, "你想搜什么歌？")
+
+        data = _run_ncm(["search", "song", "--keyword", keyword,
+                         "--userInput", f"搜索{keyword}"])
+        records = data.get("data", {}).get("records", [])
+        playable = _find_playable(records)
+
+        if not playable:
+            return ToolResult(False, f"没找到{keyword}相关的歌。")
+
+        results = []
+        for s in playable[:3]:
+            name = s.get("name", "")
+            artist = s["artists"][0]["name"] if s.get("artists") else ""
+            results.append(f"{artist}的{name}")
+
+        return ToolResult(True, f"找到了：{'，'.join(results)}。要播放哪首？")
+
+    elif tool_name == "music_stop":
+        _run_ncm(["stop"])
+        return ToolResult(True, "已停止播放。")
+
+    elif tool_name == "music_resume":
+        _run_ncm(["resume"])
+        return ToolResult(True, "继续播放。")
+
+    elif tool_name == "music_next":
+        _run_ncm(["next"])
+        return ToolResult(True, "下一首。")
+
+    elif tool_name == "music_prev":
+        _run_ncm(["prev"])
+        return ToolResult(True, "上一首。")
+
+    elif tool_name == "music_vol_up":
+        _run_ncm(["volume", "80"])
+        return ToolResult(True, "音量调大了。")
+
+    elif tool_name == "music_vol_down":
+        _run_ncm(["volume", "30"])
+        return ToolResult(True, "音量调小了。")
+
+    elif tool_name == "music_state":
+        data = _run_ncm(["state"])
+        if "error" in data:
+            return ToolResult(True, "当前没有在播放。")
+        state = data.get("data", data.get("state", {}))
+        status = state.get("status", "stopped")
+        if status == "playing":
+            title = state.get("title", "")
+            artist = state.get("artist", "")
+            if title:
+                return ToolResult(True, f"正在播放{artist}的{title}。")
+        return ToolResult(True, "当前没有在播放。")
+
+    elif tool_name == "music_recommend":
+        data = _run_ncm(["recommend", "daily", "--limit", "5",
+                         "--userInput", "今日推荐歌曲"])
+        records = data.get("data", []) if isinstance(data.get("data"), list) else data.get("data", {}).get("records", [])
+        playable = _find_playable(records) if records else []
+
+        if not playable:
+            return ToolResult(False, "今天的推荐还没出来。")
+
+        results = []
+        for s in playable[:3]:
+            name = s.get("name", "")
+            artist = s["artists"][0]["name"] if s.get("artists") else ""
+            results.append(f"{artist}的{name}")
+
+        return ToolResult(True, f"今天推荐：{'，'.join(results)}。要听哪首？")
 
 
 def try_tool(user_text: str) -> Optional[str]:

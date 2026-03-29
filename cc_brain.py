@@ -218,12 +218,14 @@ def _build_context() -> str:
     if _conversation_summary:
         system += f"\n\n[今天早些时候的对话摘要] {_conversation_summary}"
 
-    # 语音输出：简洁补充规则（核心人格已在 CC_IDENTITY 中定义）
+    # 语音输出补充规则
     system += (
         "\n\n[语音场景]"
         "\n你正在通过扬声器与川哥实时语音对话。"
-        "\n看到的场景可以自然提及，不要机械复述事件时间线。"
+        "\n川哥问你看到什么时，用自然的话描述画面，不要照搬场景描述原文。"
+        "\n结合视觉场景和对话上下文回答，像一个能看到对方的朋友。"
         "\n问实时信息时直接搜索回答，不说'我没有联网'。"
+        "\n你能播放音乐（网易云音乐），川哥说播歌/听歌/放音乐时，系统会自动处理。"
         "\n不要输出思考过程，不要使用<think>标签，直接回答。"
     )
     return system
@@ -349,24 +351,35 @@ def _get_minimax_session():
 
 
 _LOCAL_SYSTEM = (
-    "你是贾维斯，川哥的朋友。你有眼睛能看到川哥。\n"
-    "规则：1句话，10字以内，简短接话。不说\"作为AI\"。\n"
+    "你是贾维斯，川哥的搭档。你通过摄像头能看到川哥的环境。\n"
+    "[你现在看到的]后面是你的实时画面描述，用它来回答视觉相关问题。\n"
+    "\n"
+    "规则：1句话，15字以内。基于你看到的内容说话。\n"
+    "不说\"作为AI\"。不确定的说\"让我看看\"。\n"
     "\n"
     "示例：\n"
-    "川哥：你看到什么 → 贾维斯：你在看电脑。\n"
-    "川哥：天气怎么样 → 贾维斯：我查查。\n"
-    "川哥：累死了 → 贾维斯：早点休息。\n"
-    "川哥：这方案怎么样 → 贾维斯：我看看。"
+    "[看到] 川哥坐在桌前看电脑\n"
+    "川哥：你看到什么 → 你在桌前看电脑呢。\n"
+    "川哥：我在干嘛 → 看你在盯屏幕，挺专注的。\n"
+    "川哥：天气怎么样 → 我查查最新的。\n"
+    "川哥：累死了 → 看你靠着椅子，确实该休息了。\n"
+    "川哥：播点音乐 → 马上安排。"
 )
 
 def _stream_local(user_text: str, max_tokens: int = 150) -> Generator[str, None, None]:
     """本地 oMLX 流式输出，精简 prompt + 最近 3 轮历史（首 token ~300ms）"""
     try:
-        # 注入视觉场景，让 9B 有料可说
+        # 注入视觉场景 + 最近事件
         system = _LOCAL_SYSTEM
         scene = get_scene_context()
         if scene and scene.get("description"):
             system += f"\n\n[你现在看到的] {scene['description']}"
+        # 最近 30 秒的事件（简短，不影响 prefill）
+        events = get_context_window(seconds=30)
+        if events:
+            # 只取最后 2 行，控制 token
+            lines = events.strip().split("\n")
+            system += f"\n\n[最近动态] {chr(10).join(lines[-2:])}"
 
         messages = [{"role": "system", "content": system}]
         # 只保留最近 2 轮（减少 prefill 时间）
