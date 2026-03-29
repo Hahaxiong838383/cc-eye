@@ -1279,39 +1279,28 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
                     cloud_done.set()
             threading.Thread(target=_cloud, daemon=True).start()
         else:
-            # 深度问题：Gemini 先快速衔接 → GPT 深度补充 → MiniMax 兜底
-            print(f"[cc-brain] 深度思考模式 → Gemini衔接 + GPT深度 + MiniMax兜底")
+            # 深度问题：Gemini 快速概述 → MiniMax 深度展开
+            print(f"[cc-brain] 深度思考模式 → Gemini概述 + MiniMax展开")
 
             def _cloud():
-                # 阶段1：Gemini 快速概述（~2s，先给 2-3 句让用户知道在处理）
+                # 阶段1：Gemini 快速概述（~2s）
                 gemini_text = ""
                 try:
                     for s in _stream_gemini_proxy(user_text, mode="deep_intro"):
                         cloud_q.put(("cloud", s))
                         gemini_text += s
                 except Exception as e:
-                    print(f"[cc-brain] Gemini 衔接失败: {e}")
+                    print(f"[cc-brain] Gemini 概述失败: {e}")
 
                 if gemini_text:
                     print(f"[cc-brain] Gemini 概述完成: {gemini_text[:40]}...")
 
-                # 阶段2：GPT 深度展开（接着概述继续深入分析）
-                try:
-                    got_gpt = False
-                    for s in _stream_gpt_proxy(user_text):
-                        cloud_q.put(("cloud", s))
-                        got_gpt = True
-                    if got_gpt:
-                        return
-                except Exception as e:
-                    print(f"[cc-brain] GPT 深度失败: {e}，降级 MiniMax")
-
-                # 阶段3：GPT 失败时 MiniMax 兜底（用深度展开模式）
+                # 阶段2：MiniMax 深度展开
                 try:
                     for s in _stream_minimax_model(user_text, MINIMAX_DEEP, mode="deep_detail"):
                         cloud_q.put(("cloud", s))
                 except Exception as e:
-                    print(f"[cc-brain] MiniMax 也失败: {e}")
+                    print(f"[cc-brain] MiniMax 展开失败: {e}")
                 finally:
                     cloud_done.set()
             threading.Thread(target=_cloud, daemon=True).start()
