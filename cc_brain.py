@@ -1299,7 +1299,10 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
                 finished_count = 0
                 try:
                     while finished_count < 2:
-                        src, sentence = _race_q.get(timeout=0.3)
+                        try:
+                            src, sentence = _race_q.get(timeout=1.0)
+                        except queue.Empty:
+                            continue  # 继续等，不退出
                         if sentence is None:
                             finished_count += 1
                             continue
@@ -1310,8 +1313,8 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
                         # 只接受 winner 的输出
                         if src == _race_winner[0]:
                             cloud_q.put(("cloud", sentence))
-                except queue.Empty:
-                    pass
+                except Exception as e:
+                    print(f"[cc-brain] 竞速分发错误: {e}")
                 finally:
                     cloud_done.set()
             threading.Thread(target=_cloud, daemon=True).start()
@@ -1347,7 +1350,7 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     # 云端接管（跳过和 9B 重复的）
     while not cloud_done.is_set() or not cloud_q.empty():
         try:
-            source, sentence = cloud_q.get(timeout=0.3)
+            source, sentence = cloud_q.get(timeout=1.0)
             clean = sentence.strip()
             if len(re.sub(r'[。？！，、；：\s]', '', clean)) < 2:
                 continue
