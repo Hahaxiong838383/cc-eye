@@ -19,35 +19,6 @@ from typing import Optional, Tuple
 # ── UDS 客户端 ──
 
 SOCK_PATH = "/tmp/cc-tts.sock"
-_sock: Optional[socket.socket] = None
-
-
-def _get_sock() -> socket.socket:
-    """获取/重连 UDS 连接"""
-    global _sock
-    if _sock is not None:
-        try:
-            # 检测连接是否还活着
-            _sock.getpeername()
-            return _sock
-        except (OSError, socket.error):
-            _sock = None
-
-    _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    _sock.settimeout(15.0)  # 合成超时 15s
-    _sock.connect(SOCK_PATH)
-    return _sock
-
-
-def _close_sock():
-    """关闭 UDS 连接"""
-    global _sock
-    if _sock is not None:
-        try:
-            _sock.close()
-        except Exception:
-            pass
-        _sock = None
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -62,64 +33,81 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def _send_recv(req: dict) -> dict:
-    """发送请求，接收响应（长度前缀帧 + msgpack）"""
-    sock = _get_sock()
-    payload = msgpack.packb(req, use_bin_type=True)
-    sock.sendall(struct.pack(">I", len(payload)) + payload)
+    """每次新建连接，避免 barge-in 后数据流错位"""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15.0)
+    try:
+        sock.connect(SOCK_PATH)
+        payload = msgpack.packb(req, use_bin_type=True)
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
 
-    header = _recv_exact(sock, 4)
-    length = struct.unpack(">I", header)[0]
-    body = _recv_exact(sock, length)
-    return msgpack.unpackb(body, raw=False)
+        header = _recv_exact(sock, 4)
+        length = struct.unpack(">I", header)[0]
+        body = _recv_exact(sock, length)
+        return msgpack.unpackb(body, raw=False)
+    finally:
+        sock.close()
 
 
 def _remote_synthesize(text: str) -> Tuple[np.ndarray, int]:
-    """通过 UDS 远程合成"""
-    resp = _send_recv({"action": "synthesize", "text": text})
-    if not resp.get("ok"):
-        raise RuntimeError(resp.get("error", "TTS server error"))
-    pcm = np.frombuffer(resp["pcm"], dtype=np.float32).copy()
-    sr = resp["sample_rate"]
-    return pcm, sr
+    """通过 UDS 远程合成（支持流式接收，拼接后返回）"""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(15.0)
+    try:
+        sock.connect(SOCK_PATH)
+        payload = msgpack.packb({"action": "synthesize", "text": text}, use_bin_type=True)
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
+
+        # 读第一个响应
+        header = _recv_exact(sock, 4)
+        length = struct.unpack(">I", header)[0]
+        body = _recv_exact(sock, length)
+        resp = msgpack.unpackb(body, raw=False)
+
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error", "TTS server error"))
+
+        # 非流式（缓存命中）→ 直接返回
+        if not resp.get("stream"):
+            pcm = np.frombuffer(resp["pcm"], dtype=np.float32).copy()
+            return pcm, resp["sample_rate"]
+
+        # 流式 → 收集所有 chunk 拼接
+        chunks = []
+        sr = resp.get("sample_rate", 24000)
+        if "pcm" in resp:
+            chunks.append(np.frombuffer(resp["pcm"], dtype=np.float32).copy())
+            sr = resp["sample_rate"]
+
+        while True:
+            header = _recv_exact(sock, 4)
+            length = struct.unpack(">I", header)[0]
+            body = _recv_exact(sock, length)
+            chunk_resp = msgpack.unpackb(body, raw=False)
+            if chunk_resp.get("done"):
+                break
+            if "pcm" in chunk_resp:
+                chunks.append(np.frombuffer(chunk_resp["pcm"], dtype=np.float32).copy())
+                sr = chunk_resp["sample_rate"]
+
+        if not chunks:
+            raise RuntimeError("No audio chunks received")
+        return np.concatenate(chunks), sr
+    finally:
+        sock.close()
 
 
 # ── 本地降级（TTS 服务不可用时）──
-
-_fallback_model = None
+# 注意：不能在主进程加载 MLX TTS 模型，会和视觉模型冲突导致 segfault。
+# 降级策略：返回静音，等 TTS 服务恢复。
 
 
 def _local_fallback(text: str) -> Tuple[np.ndarray, int]:
-    """降级：本地直接加载模型推理（有锁竞争但至少能工作）"""
-    global _fallback_model
-    from cc_voice_profile import BASE_MODEL, REF_AUDIO_PATH, REF_TEXT
-
-    if _fallback_model is None:
-        import warnings
-        warnings.filterwarnings("ignore")
-        from mlx_audio.tts.utils import load_model
-        _fallback_model = load_model(BASE_MODEL)
-        print("[cc-tts] 降级模式：本地加载 TTS 模型")
-
-    if REF_AUDIO_PATH.exists():
-        results = list(_fallback_model.generate(
-            text=text, ref_audio=str(REF_AUDIO_PATH),
-            ref_text=REF_TEXT, lang_code="auto",
-        ))
-    else:
-        results = list(_fallback_model.generate(text=text, lang_code="auto"))
-
-    r = results[0]
-    samples = np.array(r.audio, dtype=np.float32)
-    peak = np.abs(samples).max()
-    if peak > 0.001:
-        samples = samples * (0.95 / peak)
-    silence = np.zeros(int(r.sample_rate * 0.05), dtype=np.float32)
-    fade_len = min(int(r.sample_rate * 0.02), len(samples))
-    if fade_len > 0:
-        fade = np.linspace(0, 1, fade_len, dtype=np.float32)
-        samples[:fade_len] *= fade
-    samples = np.concatenate([silence, samples])
-    return samples, r.sample_rate
+    """降级：返回静音（不在主进程加载 MLX 模型，避免和视觉冲突 crash）"""
+    print(f"[cc-tts] TTS 服务不可用，跳过: {text[:30]}")
+    sr = 24000
+    silence = np.zeros(int(sr * 0.1), dtype=np.float32)
+    return silence, sr
 
 
 # ── 本地缓存 ──

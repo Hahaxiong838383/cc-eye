@@ -56,8 +56,15 @@ _ENV_FILE = Path(__file__).parent / ".env"
 _minimax_api_key: Optional[str] = None
 _gemini_api_key: Optional[str] = None
 _doubao_api_key: Optional[str] = None
+_gemini_proxy_config: Optional[dict] = None
 
-# 豆包（云端快速路径，首 token ~300ms）
+# Gemini 代理（云端快速路径，OpenAI 兼容格式）
+GEMINI_PROXY_DEFAULTS = {
+    "base_url": "http://23.226.135.149:4000/v1",
+    "model": "gemini-2.5-flash",
+}
+
+# 豆包（备用快速路径）
 DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
 DOUBAO_MODEL = "doubao-seed-2.0-lite"
 
@@ -69,7 +76,7 @@ MINIMAX_MODEL = MINIMAX_DEEP
 # 本地模型
 # 本地 LLM：oMLX Qwen3.5-9B（OpenAI 兼容接口）
 LOCAL_LLM_API = "http://localhost:8000/v1/chat/completions"
-LOCAL_LLM_MODEL = "Qwen3.5-4B-MLX-4bit"  # 4B 更快（首句场景），9B 留给复杂时降级
+LOCAL_LLM_MODEL = "Qwen3.5-4B-MLX-4bit"  # 4B 极速首句，云端补充完整回答
 
 # Ollama 降级（oMLX 不可用时）
 OLLAMA_CHAT_API = "http://localhost:11434/api/chat"
@@ -146,6 +153,7 @@ def _load_doubao_key() -> Optional[str]:
 
 
 _doubao_session = None
+_gemini_proxy_session = None
 
 def _get_doubao_session():
     """豆包是国内服务，直连不走代理"""
@@ -154,6 +162,36 @@ def _get_doubao_session():
         _doubao_session = requests.Session()
         _doubao_session.trust_env = False
     return _doubao_session
+
+
+def _load_gemini_proxy_config() -> dict:
+    """从 .env 加载 Gemini 代理配置"""
+    global _gemini_proxy_config
+    if _gemini_proxy_config is not None:
+        return _gemini_proxy_config
+    config = dict(GEMINI_PROXY_DEFAULTS)
+    try:
+        if _ENV_FILE.exists():
+            for line in _ENV_FILE.read_text().splitlines():
+                if line.startswith("GEMINI_PROXY_BASE_URL="):
+                    config["base_url"] = line.split("=", 1)[1].strip()
+                elif line.startswith("GEMINI_PROXY_API_KEY="):
+                    config["api_key"] = line.split("=", 1)[1].strip()
+                elif line.startswith("GEMINI_PROXY_MODEL="):
+                    config["model"] = line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    _gemini_proxy_config = config
+    return config
+
+
+def _get_gemini_proxy_session():
+    """Gemini 代理走直连"""
+    global _gemini_proxy_session
+    if _gemini_proxy_session is None:
+        _gemini_proxy_session = requests.Session()
+        _gemini_proxy_session.trust_env = False
+    return _gemini_proxy_session
 
 
 def _build_context() -> str:
@@ -311,31 +349,27 @@ def _get_minimax_session():
 
 
 _LOCAL_SYSTEM = (
-    "你是贾维斯，川哥的朋友。\n"
-    "\n"
-    "规则：\n"
-    "- 口语中文，1-3句话，像朋友聊天\n"
-    "- 用\"你\"，不用\"您\"。只在打招呼时用\"川哥\"\n"
-    "- 第一句就是答案，不要铺垫\n"
-    "- 不说\"作为AI\"，你就是贾维斯\n"
-    "- 做不到的事说\"我看看\"或\"稍等\"，不说\"我不能\"\n"
+    "你是贾维斯，川哥的朋友。你有眼睛能看到川哥。\n"
+    "规则：1句话，10字以内，简短接话。不说\"作为AI\"。\n"
     "\n"
     "示例：\n"
-    "川哥：今天天气怎么样？\n"
-    "贾维斯：我看看最新的，稍等。\n"
-    "川哥：帮我查下这个bug\n"
-    "贾维斯：我想想怎么解决，你先把报错信息给我看看。\n"
-    "川哥：累死了\n"
-    "贾维斯：今天确实忙，早点休息吧。\n"
-    "川哥：这个方案你觉得怎么样\n"
-    "贾维斯：整体思路没问题，但第二步风险有点大，换成异步会稳很多。"
+    "川哥：你看到什么 → 贾维斯：你在看电脑。\n"
+    "川哥：天气怎么样 → 贾维斯：我查查。\n"
+    "川哥：累死了 → 贾维斯：早点休息。\n"
+    "川哥：这方案怎么样 → 贾维斯：我看看。"
 )
 
 def _stream_local(user_text: str, max_tokens: int = 150) -> Generator[str, None, None]:
     """本地 oMLX 流式输出，精简 prompt + 最近 3 轮历史（首 token ~300ms）"""
     try:
-        messages = [{"role": "system", "content": _LOCAL_SYSTEM}]
-        # 只保留最近 3 轮（减少 prefill 时间）
+        # 注入视觉场景，让 9B 有料可说
+        system = _LOCAL_SYSTEM
+        scene = get_scene_context()
+        if scene and scene.get("description"):
+            system += f"\n\n[你现在看到的] {scene['description']}"
+
+        messages = [{"role": "system", "content": system}]
+        # 只保留最近 2 轮（减少 prefill 时间）
         for msg in _history[-4:]:
             role = "user" if msg["role"] == "user" else "assistant"
             messages.append({"role": role, "content": msg["text"]})
@@ -385,6 +419,13 @@ def _stream_local(user_text: str, max_tokens: int = 150) -> Generator[str, None,
             for ch in token:
                 sentence_buf += ch
                 if ch in _SENTENCE_DELIMITERS:
+                    # 句号类：直接断
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    # 逗号类：攒够 8 字才断
                     s = sentence_buf.strip()
                     if s:
                         yield s
@@ -531,8 +572,94 @@ _SIMPLE_KEYWORDS = {
 }
 
 # 句子分割标点（用于流式按句 yield）
-_SENTENCE_DELIMITERS = set("。！？")  # 自然呼吸点断句
-_CLAUSE_DELIMITERS = set("，、：")
+_SENTENCE_DELIMITERS = set("。！？")  # 按句号断句
+_CLAUSE_DELIMITERS = set("，、：")    # 逗号作为次级断点（攒够长度再断）
+_MIN_CLAUSE_LEN = 8                   # 短于 8 字的逗号片段不断，攒到下一个断点
+
+
+def _stream_gemini_proxy(user_text: str) -> Generator[str, None, None]:
+    """Gemini 2.5 Flash 代理流式（OpenAI 兼容格式）"""
+    config = _load_gemini_proxy_config()
+    api_key = config.get("api_key")
+    if not api_key:
+        return
+
+    system_prompt = _build_context()
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in _history[-MAX_HISTORY:]:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["text"]})
+    messages.append({"role": "user", "content": user_text})
+
+    url = config["base_url"].rstrip("/") + "/chat/completions"
+
+    try:
+        start = time.time()
+        resp = _get_gemini_proxy_session().post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config["model"],
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 4096,
+                "stream": True,
+            },
+            timeout=20,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            print(f"[cc-brain] Gemini 代理错误: {resp.status_code} {resp.text[:200]}")
+            return
+
+        full_text = ""
+        sentence_buf = ""
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                token = json.loads(data_str)["choices"][0]["delta"].get("content", "")
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
+            if not token:
+                continue
+
+            full_text += token
+            for ch in token:
+                sentence_buf += ch
+                if ch in _SENTENCE_DELIMITERS:
+                    # 句号类：直接断
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    # 逗号类：攒够 8 字才断
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+
+        if sentence_buf.strip():
+            yield sentence_buf.strip()
+
+        elapsed = time.time() - start
+        _history.append({"role": "user", "text": user_text})
+        _history.append({"role": "model", "text": full_text})
+        print(f"[cc-brain] Gemini 代理 ({elapsed:.1f}s): {full_text[:60]}")
+
+    except Exception as e:
+        print(f"[cc-brain] Gemini 代理错误: {e}")
 
 
 def _stream_doubao(user_text: str) -> Generator[str, None, None]:
@@ -593,6 +720,13 @@ def _stream_doubao(user_text: str) -> Generator[str, None, None]:
             for ch in token:
                 sentence_buf += ch
                 if ch in _SENTENCE_DELIMITERS:
+                    # 句号类：直接断
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    # 逗号类：攒够 8 字才断
                     s = sentence_buf.strip()
                     if s:
                         yield s
@@ -611,13 +745,13 @@ def _stream_doubao(user_text: str) -> Generator[str, None, None]:
 
 
 def _needs_cloud(text: str) -> bool:
-    """判断是否需要云端补充（联网/深度分析）"""
-    cloud_keywords = {"新闻", "天气", "股价", "搜索", "查一下", "最新", "今天",
-                      "分析", "对比", "建议", "方案", "为什么", "怎么看",
-                      "帮我", "研究", "调查"}
-    if len(text) > 15:
-        return True  # 长句大概率需要深度
-    return any(kw in text for kw in cloud_keywords)
+    """4B 只说过渡语，云端必须每次补充完整回答"""
+    # 只有纯问候不需要云端
+    greet_only = {"你好", "早上好", "下午好", "晚上好", "嗨", "谢谢", "好的", "再见", "晚安"}
+    clean = text.strip().rstrip("。！？，")
+    if clean in greet_only:
+        return False
+    return True
 
 
 def _stream_gemini(user_text: str) -> Generator[str, None, None]:
@@ -743,6 +877,13 @@ def _stream_minimax_model(user_text: str, model: str) -> Generator[str, None, No
             for ch in token:
                 sentence_buf += ch
                 if ch in _SENTENCE_DELIMITERS:
+                    # 句号类：直接断
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    # 逗号类：攒够 8 字才断
                     s = sentence_buf.strip()
                     if s:
                         yield s
@@ -930,7 +1071,7 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
 
     def _local():
         try:
-            for s in _stream_local(user_text, max_tokens=150):
+            for s in _stream_local(user_text, max_tokens=30):
                 local_q.put(("local", s))
         except Exception:
             pass
@@ -946,7 +1087,7 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     if need_cloud:
         def _cloud():
             try:
-                for s in _stream_doubao(user_text):
+                for s in _stream_gemini_proxy(user_text):
                     cloud_q.put(("cloud", s))
             except Exception:
                 pass

@@ -632,7 +632,9 @@ class JarvisV3:
 
         threading.Thread(target=_synth, daemon=True).start()
 
-        # 主线程：逐句播放
+        # 主线程：逐句播放（段间 crossfade 消除接缝）
+        is_first_segment = True
+        CROSSFADE_MS = 15  # 段间交叉淡化毫秒数
         while self._responding:
             try:
                 item = synth_queue.get(timeout=0.1)
@@ -644,6 +646,19 @@ class JarvisV3:
             if not self._responding:
                 break
 
+            # 非首段：裁掉前面的静音前缀（约 50ms + 20ms 淡入）
+            if not is_first_segment and sr > 0:
+                skip = int(sr * 0.05)  # 跳过 50ms 静音
+                if len(pcm) > skip + 100:
+                    pcm = pcm[skip:]
+                # 段间 crossfade 淡入（消除接缝"喘气"声）
+                fade_in_len = min(int(sr * CROSSFADE_MS / 1000), len(pcm))
+                if fade_in_len > 0:
+                    fade = np.linspace(0.3, 1.0, fade_in_len, dtype=np.float32)
+                    pcm = pcm.copy()
+                    pcm[:fade_in_len] *= fade
+            is_first_segment = False
+
             self._recent_tts.append(sentence)
             if len(self._recent_tts) > 5:
                 self._recent_tts.pop(0)
@@ -652,7 +667,6 @@ class JarvisV3:
             while not self.player.wait(timeout=0.05):
                 if not self._responding:
                     self.player.interrupt()
-                    # 清空合成队列残留
                     while not synth_queue.empty():
                         try: synth_queue.get_nowait()
                         except: break

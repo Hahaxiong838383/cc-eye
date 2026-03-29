@@ -79,7 +79,7 @@ class VisionEngine:
             return
         from mlx_vlm import load
         print("[vision] 加载快扫模型 (2B)...")
-        with self._mlx_lock:
+        with self._mlx_lock:  # 加载时阻塞等锁（只发生一次）
             self._fast_model, self._fast_processor = load(FAST_MODEL)
         print("[vision] 快扫模型就绪")
 
@@ -89,7 +89,7 @@ class VisionEngine:
             return
         from mlx_vlm import load
         print("[vision] 加载精扫模型 (7B)...")
-        with self._mlx_lock:
+        with self._mlx_lock:  # 加载时阻塞等锁（只发生一次）
             self._detail_model, self._detail_processor = load(DETAIL_MODEL)
         print("[vision] 精扫模型就绪")
 
@@ -123,9 +123,14 @@ class VisionEngine:
         try:
             config = load_config(model_id)
             formatted = apply_chat_template(processor, config, prompt, num_images=1)
-            with self._mlx_lock:
+            # trylock：拿不到锁就跳过本轮，不阻塞 STT
+            if not self._mlx_lock.acquire(timeout=0.1):
+                return None
+            try:
                 output = generate(model, processor, formatted, [image_path],
                                   max_tokens=150, verbose=False)
+            finally:
+                self._mlx_lock.release()
             # output 可能是 str 或 GenerationResult
             if hasattr(output, 'text'):
                 text = output.text

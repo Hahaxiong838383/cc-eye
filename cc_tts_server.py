@@ -208,52 +208,115 @@ def _handle_request(data: dict) -> dict:
         if not text:
             return {"ok": False, "error": "empty text"}
 
-        try:
-            t0 = time.time()
-            pcm, sr = _synthesize(text)
-            elapsed_ms = (time.time() - t0) * 1000
-            cached = text in _audio_cache
-            if not cached:
-                # 新合成的加入缓存
-                _audio_cache[text] = (pcm, sr)
-            print(f"[tts-server] {'cache' if cached else f'{elapsed_ms:.0f}ms'} | {text[:40]}")
+        # 缓存命中 → 直接返回完整 PCM
+        if text in _audio_cache:
+            pcm, sr = _audio_cache[text]
+            print(f"[tts-server] cache | {text[:40]}")
             return {
                 "ok": True,
                 "pcm": pcm.tobytes(),
                 "sample_rate": sr,
                 "shape": list(pcm.shape),
+                "stream": False,
             }
-        except Exception as e:
-            print(f"[tts-server] 合成错误: {e}")
-            return {"ok": False, "error": str(e)}
+
+        # 缓存未命中 → 标记为流式，由 _handle_client 处理
+        return {"_stream_text": text}
+
+    if action == "synthesize_stream":
+        # 显式流式请求（兼容）
+        text = data.get("text", "")
+        if not text:
+            return {"ok": False, "error": "empty text"}
+        return {"_stream_text": text}
 
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
+def _stream_to_client(conn: socket.socket, text: str):
+    """流式合成并逐 chunk 发送给客户端"""
+    model = _get_model()
+    t0 = time.time()
+    all_chunks = []
+
+    if not REF_AUDIO_PATH.exists():
+        gen = model.generate(text=text, lang_code="auto",
+                             stream=True, streaming_interval=0.3)
+    else:
+        gen = model.generate(text=text, ref_audio=str(REF_AUDIO_PATH),
+                             ref_text=REF_TEXT, lang_code="auto",
+                             stream=True, streaming_interval=0.3)
+
+    for result in gen:
+        samples = np.array(result.audio, dtype=np.float32)
+        if len(samples) == 0:
+            continue
+        # 不做独立归一化（避免 chunk 间音量跳变），最后统一处理
+        all_chunks.append(samples)
+
+        # 发送 chunk（stream=True 标记）
+        chunk_resp = msgpack.packb({
+            "ok": True,
+            "stream": True,
+            "pcm": samples.tobytes(),
+            "sample_rate": result.sample_rate,
+            "shape": list(samples.shape),
+            "done": False,
+        }, use_bin_type=True)
+        conn.sendall(struct.pack(">I", len(chunk_resp)) + chunk_resp)
+
+    # 发送结束标记
+    done_resp = msgpack.packb({"ok": True, "stream": True, "done": True}, use_bin_type=True)
+    conn.sendall(struct.pack(">I", len(done_resp)) + done_resp)
+
+    elapsed_ms = (time.time() - t0) * 1000
+    print(f"[tts-server] {elapsed_ms:.0f}ms stream | {text[:40]}")
+
+    # 拼接完整音频加入缓存
+    if all_chunks:
+        full_pcm = np.concatenate(all_chunks)
+        # 加 50ms 静音 + 20ms 淡入
+        sr = 24000
+        silence = np.zeros(int(sr * 0.05), dtype=np.float32)
+        fade_len = min(int(sr * 0.02), len(full_pcm))
+        if fade_len > 0:
+            fade = np.linspace(0, 1, fade_len, dtype=np.float32)
+            full_pcm[:fade_len] *= fade
+        full_pcm = np.concatenate([silence, full_pcm])
+        _audio_cache[text] = (full_pcm, sr)
+
+
 def _handle_client(conn: socket.socket):
-    """处理一个客户端连接（可能多次请求）"""
+    """处理一个客户端连接（短连接，一次请求）"""
     try:
-        while _running:
-            # 读长度前缀（4 bytes，big-endian uint32）
-            try:
-                header = _recv_exact(conn, 4)
-            except ConnectionError:
-                break
-            length = struct.unpack(">I", header)[0]
-            if length > MAX_MSG_SIZE:
-                break
+        # 读长度前缀
+        try:
+            header = _recv_exact(conn, 4)
+        except ConnectionError:
+            return
+        length = struct.unpack(">I", header)[0]
+        if length > MAX_MSG_SIZE:
+            return
 
-            # 读 msgpack 包体
-            body = _recv_exact(conn, length)
-            req = msgpack.unpackb(body, raw=False)
+        body = _recv_exact(conn, length)
+        req = msgpack.unpackb(body, raw=False)
 
-            # 处理请求
-            resp = _handle_request(req)
+        # 处理请求
+        resp = _handle_request(req)
 
-            # 发送响应（长度前缀 + msgpack）
-            resp_bytes = msgpack.packb(resp, use_bin_type=True)
-            conn.sendall(struct.pack(">I", len(resp_bytes)) + resp_bytes)
+        # 如果需要流式合成
+        if "_stream_text" in resp:
+            _stream_to_client(conn, resp["_stream_text"])
+            return
 
+        # 普通响应
+        resp_bytes = msgpack.packb(resp, use_bin_type=True)
+        conn.sendall(struct.pack(">I", len(resp_bytes)) + resp_bytes)
+
+    except BrokenPipeError:
+        pass
+    except ConnectionError:
+        pass
     except Exception as e:
         print(f"[tts-server] 客户端错误: {e}")
     finally:
