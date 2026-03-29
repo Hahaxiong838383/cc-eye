@@ -720,7 +720,7 @@ def _stream_gemini_proxy(user_text: str) -> Generator[str, None, None]:
 
 
 def _stream_gpt_proxy(user_text: str) -> Generator[str, None, None]:
-    """GPT 5.4 代理（云端深度思考，非流式——代理不支持 SSE stream）"""
+    """GPT 5.4 代理流式（云端深度思考，SSE stream）"""
     config = _load_gpt_proxy_config()
 
     system_prompt = _build_context("deep")
@@ -742,28 +742,55 @@ def _stream_gpt_proxy(user_text: str) -> Generator[str, None, None]:
                 "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 4096,
+                "stream": True,
             },
             timeout=60,
+            stream=True,
         )
         if resp.status_code != 200:
             print(f"[cc-brain] GPT 代理错误: {resp.status_code} {resp.text[:200]}")
             return
 
-        data = resp.json()
-        full_text = data["choices"][0]["message"]["content"].strip()
+        full_text = ""
+        sentence_buf = ""
 
-        if not full_text:
-            print("[cc-brain] GPT 代理返回空内容")
-            return
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="ignore")
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                token = json.loads(data_str)["choices"][0]["delta"].get("content", "")
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
+            if not token:
+                continue
+
+            full_text += token
+            for ch in token:
+                sentence_buf += ch
+                if ch in _SENTENCE_DELIMITERS:
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+                elif ch in _CLAUSE_DELIMITERS and len(sentence_buf) >= _MIN_CLAUSE_LEN:
+                    s = sentence_buf.strip()
+                    if s:
+                        yield s
+                    sentence_buf = ""
+
+        if sentence_buf.strip():
+            yield sentence_buf.strip()
 
         elapsed = time.time() - start
         _history.append({"role": "user", "text": user_text})
         _history.append({"role": "model", "text": full_text})
         print(f"[cc-brain] GPT 代理 ({elapsed:.1f}s): {full_text[:60]}")
-
-        # 非流式回复按句切分 yield
-        for sentence in _split_sentences(full_text):
-            yield sentence
 
     except Exception as e:
         print(f"[cc-brain] GPT 代理错误: {e}")
