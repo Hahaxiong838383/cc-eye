@@ -50,7 +50,11 @@ AUDIO_PATH = "/tmp/cc-jarvis-segment.wav"
 # 唤醒词
 WAKE_WORDS = ["贾维斯", "jarvis", "嘉维斯", "贾维丝",
               "小维斯", "蒋维斯", "夏维斯", "茶维斯", "加维斯",
-              "假维斯", "甲维斯", "家维斯", "维斯"]
+              "假维斯", "甲维斯", "家维斯", "维斯",
+              # STT 常见误识别
+              "亚威斯", "亚维斯", "雅维斯", "压维斯",
+              "佳维斯", "伽维斯", "迦维斯",
+              "为什么", "威斯", "微思"]
 
 # 安静模式触发词
 QUIET_WORDS = ["安静", "别说了", "闭嘴", "不要说话", "听着就行",
@@ -523,13 +527,18 @@ class JarvisV3:
 
     @staticmethod
     def _has_weisi(text: str) -> bool:
-        """拼音匹配：包含连续 'wei'+'si' 音就是唤醒词"""
+        """拼音模糊匹配：覆盖 STT 常见误识别的"X维斯"变体"""
         py = lazy_pinyin(text)
+        # 第一音节：wei/vi 变体
+        wei_set = {"wei", "vi", "wai"}
+        # 第二音节：si/shi/se/s 变体
+        si_set = {"si", "shi", "se", "s", "ssi", "zi", "ci"}
         for i in range(len(py) - 1):
-            if py[i] == 'wei' and py[i + 1] == 'si':
+            if py[i] in wei_set and py[i + 1] in si_set:
                 return True
-        # 英文 jarvis 兜底
-        if 'jarvis' in text.lower():
+        # 英文 jarvis/javis 兜底
+        text_lower = text.lower()
+        if 'jarvis' in text_lower or 'javis' in text_lower:
             return True
         return False
 
