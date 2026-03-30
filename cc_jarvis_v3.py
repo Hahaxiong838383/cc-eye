@@ -82,10 +82,12 @@ class JarvisV3:
         # 唤醒词检测（音频级）
         self._oww = None
         try:
-            import openwakeword
             from openwakeword.model import Model as OWWModel
-            self._oww = OWWModel(wakeword_models=["hey_jarvis_v0.1"])
-            logger.info("openwakeword 就绪 (hey_jarvis)")
+            self._oww = OWWModel(
+                wakeword_models=["hey_jarvis_v0.1"],
+                inference_framework="onnx",
+            )
+            logger.info("openwakeword 就绪 (hey_jarvis, onnx)")
         except Exception as e:
             logger.warning(f"openwakeword 加载失败: {e}，使用文本匹配")
 
