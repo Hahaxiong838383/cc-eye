@@ -224,7 +224,10 @@ _TOOL_PATTERNS: list[tuple[str, str, int]] = [
 _MUSIC_HINTS = {"歌", "音乐", "曲", "嗨", "安静", "轻松", "助眠", "提神",
                 "氛围", "伤感", "开心", "工作", "加班", "跑步", "运动",
                 "古典", "爵士", "摇滚", "民谣", "电子", "嘻哈", "说唱",
-                "播播", "放放", "听听"}
+                "播播", "放放", "听听",
+                # 常见歌手名（避免"周杰伦的吧"无法匹配）
+                "周杰伦", "林俊杰", "陈奕迅", "薛之谦", "毛不易", "李荣浩",
+                "邓紫棋", "Taylor", "Adele", "五月天", "Beyond"}
 
 
 def detect_tool_intent(text: str) -> Optional[Tuple[str, str]]:
@@ -404,13 +407,21 @@ def _execute_music(tool_name: str, content: str) -> ToolResult:
         return ToolResult(True, f"正在播放{artist}的{song_name}。")
 
     elif tool_name == "music_random":
+        # 先试每日推荐
         data = _run_ncm(["recommend", "daily", "--limit", "10",
                          "--userInput", "随机播放推荐音乐"])
         records = data.get("data", []) if isinstance(data.get("data"), list) else data.get("data", {}).get("records", [])
         playable = _find_playable(records) if records else []
 
+        # 推荐失败时搜索热门歌曲兜底
         if not playable:
-            return ToolResult(False, "推荐没拿到，你告诉我想听什么吧。")
+            data = _run_ncm(["search", "song", "--keyword", "热门 流行",
+                             "--userInput", "随机播放热门歌曲"])
+            records = data.get("data", {}).get("records", [])
+            playable = _find_playable(records)
+
+        if not playable:
+            return ToolResult(False, "没找到可以播的歌，你告诉我想听什么吧。")
 
         song = playable[0]
         song_name = song.get("name", "未知")
