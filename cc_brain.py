@@ -1372,6 +1372,83 @@ def think_stream(user_text: str) -> Generator[str, None, None]:
     post_event("response", "cc回复完成", source="brain")
     _maybe_summarize()
 
+    # 视觉持续学习：后台提取视觉事实
+    scene = get_scene_context()
+    scene_desc = scene.get("description", "") if scene else ""
+    if scene_desc and cloud_started:
+        _maybe_extract_visual_fact(user_text, scene_desc)
+
+
+# ── 视觉持续学习 ──
+
+_VISUAL_FACT_FILE = Path("/tmp/cc-eye-visual-facts.jsonl")
+
+_FACT_EXTRACT_PROMPT = """\
+你是记忆提取器。从以下对话和视觉场景中，提取值得长期记住的事实。
+
+规则：
+- 只提取关于川哥的习惯、偏好、环境、状态的观察
+- 输出一条简短的事实（15字以内），或输出"无"
+- 不要记录对话内容本身，只记录从视觉观察到的事实
+- 格式：直接输出事实文本，不加标点以外的格式
+
+示例：
+川哥说"我在忙什么" + 看到"戴眼镜在写代码" → 川哥晚上在写代码
+川哥说"你好" + 看到"坐在椅子上" → 无
+川哥说"累死了" + 看到"双手扶额，表情疲惫" → 川哥工作后显得疲惫
+川哥说"天气怎么样" + 看到"桌上放着咖啡杯" → 川哥桌上常放咖啡"""
+
+
+def _maybe_extract_visual_fact(user_text: str, scene_desc: str):
+    """后台提取视觉事实（用 4B 本地模型，不阻塞主流程）"""
+    import threading
+
+    def _extract():
+        if not scene_desc or len(user_text) < 3:
+            return
+        # 纯问候不提取
+        greet = {"你好", "早上好", "下午好", "晚上好", "嗨", "谢谢", "好的", "再见", "晚安"}
+        if user_text.strip().rstrip("。！？，") in greet:
+            return
+
+        try:
+            prompt = f"{_FACT_EXTRACT_PROMPT}\n\n川哥说：{user_text}\n看到：{scene_desc}\n提取："
+            s = __import__("requests").Session()
+            s.trust_env = False
+            resp = s.post(
+                LOCAL_LLM_API,
+                json={
+                    "model": LOCAL_LLM_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 30,
+                    "temperature": 0.3,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return
+            fact = resp.json()["choices"][0]["message"]["content"].strip()
+            # 过滤"无"和太短的结果
+            if not fact or fact == "无" or len(fact) < 4:
+                return
+            # 写入事实文件
+            from datetime import datetime
+            entry = {
+                "ts": datetime.now().isoformat(),
+                "fact": fact,
+                "source": "visual",
+                "user_text": user_text[:50],
+                "scene": scene_desc[:100],
+            }
+            with open(_VISUAL_FACT_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            print(f"[cc-brain] 视觉事实提取: {fact}")
+        except Exception as e:
+            print(f"[cc-brain] 视觉事实提取失败: {e}")
+
+    threading.Thread(target=_extract, daemon=True).start()
+
 
 def think(user_text: str) -> str:
     """

@@ -169,11 +169,57 @@ class VisionEngine:
         }
         SCENE_FILE.write_text(json.dumps(scene, ensure_ascii=False))
 
+    def _hourly_digest(self):
+        """每小时汇总视觉观察，追加到 RECENT_EVENTS.md"""
+        try:
+            if not EVENTS_FILE.exists():
+                return
+            # 读取最近 1 小时的事件
+            from datetime import datetime, timedelta
+            cutoff = datetime.now() - timedelta(hours=1)
+            recent = []
+            for line in EVENTS_FILE.read_text().strip().split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    evt = json.loads(line)
+                    ts = datetime.fromisoformat(evt["ts"])
+                    if ts > cutoff:
+                        recent.append(evt.get("detail", "")[:80])
+                except Exception:
+                    continue
+
+            if len(recent) < 3:
+                return  # 事件太少不汇总
+
+            # 生成一句话汇总（简单拼接去重，不走 LLM）
+            unique = []
+            seen = set()
+            for desc in recent:
+                key = desc[:20]
+                if key not in seen:
+                    unique.append(desc)
+                    seen.add(key)
+
+            now = datetime.now()
+            hour_start = now.replace(minute=0, second=0).strftime("%H:%M")
+            digest = f"视觉观察 {hour_start}：" + "；".join(unique[:3])
+
+            # 追加到 RECENT_EVENTS.md
+            recent_events = Path.home() / "mycc" / "0-System" / "RECENT_EVENTS.md"
+            if recent_events.exists():
+                with open(recent_events, "a", encoding="utf-8") as f:
+                    f.write(f"- `{now.strftime('%H:%M')}` {digest}\n")
+                print(f"[vision] 小时汇总: {digest[:60]}")
+        except Exception as e:
+            print(f"[vision] 小时汇总失败: {e}")
+
     def _monitor_loop(self):
         """视觉监控主循环"""
         print("[vision] 监控启动")
         last_fast = 0
         last_detail = 0
+        last_hourly_digest = time.time()
 
         # 启动时先做一次快扫
         time.sleep(2)  # 等摄像头稳定
@@ -204,6 +250,11 @@ class VisionEngine:
                         self._post_event("detail_scan", desc)
                         print(f"[vision] 精扫: {desc[:80]}")
                 last_detail = now
+
+                # 小时汇总（精扫后检查）
+                if now - last_hourly_digest >= 3600:
+                    self._hourly_digest()
+                    last_hourly_digest = now
 
             time.sleep(1)
 

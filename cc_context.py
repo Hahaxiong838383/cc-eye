@@ -82,6 +82,31 @@ def get_scene_context() -> Optional[dict]:
         return None
 
 
+def _get_visual_facts(max_items: int = 10) -> str:
+    """读取视觉长期观察事实（从 /tmp/cc-eye-visual-facts.jsonl）"""
+    facts_file = Path("/tmp/cc-eye-visual-facts.jsonl")
+    if not facts_file.exists():
+        return ""
+    try:
+        facts = []
+        seen = set()
+        for line in facts_file.read_text().strip().split("\n"):
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            fact = entry.get("fact", "").strip()
+            if fact and fact != "无" and fact not in seen:
+                facts.append(fact)
+                seen.add(fact)
+        if not facts:
+            return ""
+        # 取最近 N 条，去重
+        recent = facts[-max_items:]
+        return "；".join(recent)
+    except Exception:
+        return ""
+
+
 def get_camera_events(n: int = 5) -> str:
     """获取最近 N 条摄像头事件"""
     if not EVENTS_FILE.exists():
@@ -128,6 +153,10 @@ def build_system_prompt(task: str = "vision") -> str:
         memory = get_memory_items(800)
         if memory:
             parts.append(f"[记忆]\n{memory[:800]}")
+        # 注入视觉长期观察（如果有）
+        visual_facts = _get_visual_facts()
+        if visual_facts:
+            parts.append(f"[你对川哥的长期观察]\n{visual_facts}")
 
     elif task == "home":
         parts.append("你是 cc 的智能家居控制分身。根据环境和指令控制设备。")

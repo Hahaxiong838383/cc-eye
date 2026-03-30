@@ -279,12 +279,38 @@ def main() -> None:
     _append_to_recent_events(summary)
 
     # 4. 原子记忆由 cc 的进化自查任务在 22:35 读取 RECENT_EVENTS 时自动提取
-    #    这里只打印提示，不直接写 memory-items.md（避免并发冲突，参考 E09）
     if memory_items:
         print(f"[memory-bridge] 原子记忆已提取，等待进化自查任务处理")
-        # 写到临时文件供进化自查读取
         tmp_file = Path("/tmp/cc-eye-memory-candidates.txt")
         tmp_file.write_text(f"# {date.today()} 贾维斯感知提取\n\n{memory_items}\n")
+
+    # 5. 合并视觉事实到候选记忆
+    visual_facts_file = Path("/tmp/cc-eye-visual-facts.jsonl")
+    if visual_facts_file.exists():
+        try:
+            facts = []
+            seen = set()
+            for line in visual_facts_file.read_text().splitlines():
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                fact = entry.get("fact", "").strip()
+                if fact and fact != "无" and fact not in seen:
+                    facts.append(fact)
+                    seen.add(fact)
+            if facts:
+                # 追加到候选文件
+                tmp_file = Path("/tmp/cc-eye-memory-candidates.txt")
+                existing = tmp_file.read_text() if tmp_file.exists() else ""
+                visual_section = "\n\n## [user/习惯] 视觉观察\n"
+                for f in facts[-20:]:  # 最多保留 20 条
+                    visual_section += f"- ★★ {f} [{date.today()}] #视觉\n"
+                tmp_file.write_text(existing + visual_section)
+                print(f"[memory-bridge] 视觉事实合并: {len(facts)} 条")
+            # 清空已处理的事实文件
+            visual_facts_file.write_text("")
+        except Exception as e:
+            print(f"[memory-bridge] 视觉事实合并失败: {e}")
 
     print("[memory-bridge] 完成")
 
